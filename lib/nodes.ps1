@@ -1,8 +1,30 @@
 . "$PSScriptRoot\core.ps1"
 
+function Ensure-NetEnvGeoIP {
+  $paths = Get-NetEnvPaths
+  $target = Join-Path $paths.Data 'geoip.metadb'
+  if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 1000000) { return $true }
+  $urls = @(
+    'https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb',
+    'https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb'
+  )
+  foreach ($u in $urls) {
+    try {
+      & curl.exe -sS -L -C - --fail --connect-timeout 15 --max-time 300 -o $target $u
+      if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 1000000) {
+        Write-NetEnvLog 'INFO' 'geoip.metadb 下载完成'
+        return $true
+      }
+    } catch { }
+  }
+  Write-NetEnvLog 'WARN' 'geoip.metadb 下载失败（国内直连分流将不可用）'
+  return $false
+}
+
 function Invoke-NetEnvNodesRefresh {
   $cfg = Read-NetEnvConfig
   $paths = Get-NetEnvPaths
+  $null = Ensure-NetEnvGeoIP
   $subDir = Join-Path $paths.Data 'subs'
   if (-not (Test-Path -LiteralPath $subDir)) { New-Item -ItemType Directory -Path $subDir -Force | Out-Null }
 
@@ -214,10 +236,10 @@ proxy-groups:
     tolerance: $($Cfg.subscription.urlTest.tolerance)
     lazy: $($Cfg.subscription.urlTest.lazy.ToString().ToLower())
     proxies:
-      - DIRECT
 $($groupNames -join "`n")
 rules:
 $ruleText
+    - GEOIP,CN,DIRECT
     - MATCH,auto-select
 "@
   return $merged
