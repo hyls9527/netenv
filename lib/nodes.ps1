@@ -94,7 +94,7 @@ function Get-ClashProxyEntries {
     if (-not $inProxies -and $line -match '^\s*proxies\s*:') { $inProxies = $true; continue }
     if (-not $inProxies) { continue }
     if ($line -match '^\S') { break }
-    if ($line -match '^\s+-\s+name\s*:') {
+    if ($line -match '^\s+-\s+') {
       if ($cur.Count -gt 0) { $entries.Add(($cur -join "`n")) }
       $cur = [System.Collections.Generic.List[string]]::new()
       $cur.Add($line)
@@ -150,7 +150,8 @@ function Build-NetEnvMergedConfig {
   foreach ($f in $files) {
     $text = Get-Content -LiteralPath $f.FullName -Raw
     foreach ($e in (Get-ClashProxyEntries $text)) {
-      $m = [regex]::Match($e, '(?m)^\s+-\s+name\s*:\s*(.+?)\s*$')
+      if ($e -notmatch '(?m)^\s+-\s+(name|cipher)\s*:') { continue }
+      $m = [regex]::Match($e, '(?m)^\s+(?:-\s+)?name\s*:\s*(.+?)\s*$')
       if ($m.Success) {
         $name = $m.Groups[1].Value.Trim()
         if ($name.Length -ge 2 -and $name[0] -eq '"' -and $name[$name.Length - 1] -eq '"') {

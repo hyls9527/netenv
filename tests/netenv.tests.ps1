@@ -79,16 +79,21 @@ proxies:
     - name: n3
       type: trojan
       server: 3.3.3.3
+    - cipher: chacha20-ietf-poly1305
+      name: n5
+      server: 5.5.5.5
+      type: ss
 '@ -Encoding utf8
       $cfg = Read-NetEnvConfig
       $out = Build-NetEnvMergedConfig $subDir $cfg
       ($out | Select-String -Pattern 'name: n1').Count | Should BeGreaterThan 0
       ($out | Select-String -Pattern 'name: n3').Count | Should BeGreaterThan 0
-      @(Get-ClashProxyEntries $out).Count | Should Be 4
+      @(Get-ClashProxyEntries $out).Count | Should Be 5
       $out | Should Match 'DOMAIN-SUFFIX,github.com,DIRECT'
       $out | Should Match 'name: auto-select'
       $out | Should Match 'DIRECT'
       $out | Should Match 'n3'
+      $out | Should Match 'n5'
       $out | Should Not Match '""'
       $out | Should Match '🔴_n4'
     } finally {
