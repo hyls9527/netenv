@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "mode": "portable",
+  "ports": {
+    "mihomoMixed": 7890,
+    "mihomoHttp": 7897,
+    "mihomoController": 19090,
+    "newApi": 8093,
+    "subStore": 8099
+  },
+  "profiles": {
+    "direct": { "systemProxy": false, "gitProxy": "", "npmProxy": "", "envProxy": false },
+    "proxy": { "systemProxy": true, "gitProxy": "http://127.0.0.1:7897", "npmProxy": "http://127.0.0.1:7897", "envProxy": true },
+    "github": { "systemProxy": false, "gitProxy": "http://127.0.0.1:7897", "npmProxy": "", "envProxy": false }
+  },
+  "noProxy": [
+    "localhost", "127.0.0.1", "::1",
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "*.cn", "github.com", "api.github.com", "codeload.github.com", "ssh.github.com"
+  ],
+  "sensitiveDomains": [
+    "*.bankofchina.com", "*.icbc.com.cn", "*.ccb.com", "*.abchina.com", "*.psbc.com", "*.cmbchina.com",
+    "*.qq.com/mail", "*.163.com/mail", "*.gmail.com", "*.outlook.com",
+    "github.com", "api.github.com", "codeload.github.com", "ssh.github.com", "*.login.microsoftonline.com"
+  ],
+  "githubAuthDomains": [
+    "github.com", "api.github.com", "codeload.github.com", "ssh.github.com", "raw.githubusercontent.com"
+  ],
+  "guardianTasks": [
+    "AI-Stack-Guardian", "OW-Proxy-Guardian", "OW-Proxy-Startup", "FreeProxy-Refresh",
+    "Permafrost-Guardian", "Permafrost-Guardian-Logon", "VoiceGPT-Guardian", "DevSidecar-Guardian"
+  ],
+  "startupItems": [
+    "语音ChatGPT-开机启动.lnk", "start-agent-autostart.cmd", "run-ow-guardian.vbs", "run-voice-guardian.vbs",
+    "run-permafrost-guardian.vbs", "run-free-refresh.vbs", "start-ai-stack-hidden.vbs"
+  ],
+  "oldProcesses": [
+    "mihomo-windows-amd64", "gemini-web2api-go", "token-free-gateway-windows-x64",
+    "_tmp_openai_overwall\\voice_server.py", "_tmp_openai_overwall\\dsh-install"
+  ],
+  "subscription": {
+    "urlTest": { "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50, "lazy": true }
+  },
+  "supervisor": { "intervalMinutes": 5, "maxRestartPerRound": 3, "maxFailingRounds": 3 },
+  "mcp": { "allowWrite": false },
+  "logging": { "dir": "logs", "rotateDays": 30 },
+  "secrets": {
+    "archiveDir": "C:\\Users\\Admin\\Downloads",
+    "archivePrefix": "NetEnv-密钥备份"
+  },
+  "binaries": {
+    "mihomo": { "source": "MetaCubeX/mihomo", "filename": "mihomo-windows-amd64.exe" },
+    "subStore": { "source": "sub-store-org/Sub-Store", "filename": "sub-store.exe" },
+    "newApi": { "source": "QuantumNous/new-api", "filename": "new-api.exe" }
+  }
+}

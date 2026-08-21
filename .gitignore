@@ -1,0 +1,10 @@
+data/
+logs/
+backups/
+export/
+*.7z
+*.zip
+*.psw
+*.cred
+*secrets*.txt
+config/local.*
