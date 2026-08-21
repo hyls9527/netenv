@@ -169,40 +169,44 @@ function Build-NetEnvMergedConfig {
   }
   if ($order.Count -eq 0) { return '' }
 
-  $base = Get-Content -LiteralPath $files[0].FullName -Raw
-  $base = Remove-NetEnvDangerousFields $base
-
   $proxiesLines = [System.Collections.Generic.List[string]]::new()
   foreach ($n in $order) { $proxiesLines.Add((ConvertTo-NetEnvNormalizedEntry $byName[$n])) }
   $proxiesBlock = ($proxiesLines -join "`n")
-
-  if ($base -match '(?m)^proxies\s*:') {
-    $base = [regex]::Replace($base, '(?ms)^proxies\s*:\s*\r?\n.*?(?=^\S|\z)', "proxies:`n$proxiesBlock`n", 1)
-  } else {
-    $base = $base.TrimEnd() + "`n`nproxies:`n$proxiesBlock`n"
-  }
 
   $directDomains = @()
   foreach ($d in @($Cfg.sensitiveDomains) + @($Cfg.githubAuthDomains)) {
     $dom = (($d -replace '^\*\.', '') -split '/')[0]
     if ($dom -and ($directDomains -notcontains $dom)) { $directDomains += $dom }
   }
-  $ruleIndent = '    '
-  $ruleFirst = [regex]::Match($base, '(?ms)^rules\s*:\s*\r?\n(\s*)- ')
-  if ($ruleFirst.Success) { $ruleIndent = $ruleFirst.Groups[1].Value }
-  $ruleLines = foreach ($dom in $directDomains) { "$ruleIndent- DOMAIN-SUFFIX,$dom,DIRECT" }
+  $ruleLines = foreach ($dom in $directDomains) { "    - DOMAIN-SUFFIX,$dom,DIRECT" }
   $ruleText = $ruleLines -join "`n"
-  if ($base -match '(?m)^rules\s*:') {
-    $base = [regex]::Replace($base, '(?ms)^(rules\s*:\s*\r?\n)(\s+- )', "`$1$ruleText`n`$2", 1)
-  } else {
-    $base = $base.TrimEnd() + "`n`nrules:`n$ruleText`n$ruleIndent- MATCH,auto-select`n"
-  }
 
   $groupNames = foreach ($n in $order) {
     $esc = $n.Replace('\', '\\').Replace('"', '\"')
     "      - `"$esc`""
   }
-  $group = @"
+
+  $merged = @"
+mixed-port: $($Cfg.ports.mihomoMixed)
+port: $($Cfg.ports.mihomoHttp)
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:$($Cfg.ports.mihomoController)
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://doh.pub/dns-query
+    - https://223.5.5.5/dns-query
+proxies:
+$proxiesBlock
+proxy-groups:
   - name: auto-select
     type: url-test
     url: $($Cfg.subscription.urlTest.url)
@@ -212,12 +216,9 @@ function Build-NetEnvMergedConfig {
     proxies:
       - DIRECT
 $($groupNames -join "`n")
+rules:
+$ruleText
+    - MATCH,auto-select
 "@
-  if ($base -match '(?m)^proxy-groups\s*:') {
-    $base = [regex]::Replace($base, '(?ms)^(proxy-groups\s*:\s*\r?\n)', "`$1$group`n", 1)
-  } else {
-    $base = $base.TrimEnd() + "`n`nproxy-groups:`n$group`n"
-  }
-
-  return $base
+  return $merged
 }

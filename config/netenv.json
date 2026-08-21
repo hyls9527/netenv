@@ -16,15 +16,15 @@
   "noProxy": [
     "localhost", "127.0.0.1", "::1",
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "*.cn", "github.com", "api.github.com", "codeload.github.com", "ssh.github.com"
+    "*.cn", "api.github.com", "codeload.github.com", "ssh.github.com"
   ],
   "sensitiveDomains": [
     "*.bankofchina.com", "*.icbc.com.cn", "*.ccb.com", "*.abchina.com", "*.psbc.com", "*.cmbchina.com",
     "*.qq.com/mail", "*.163.com/mail", "*.gmail.com", "*.outlook.com",
-    "github.com", "api.github.com", "codeload.github.com", "ssh.github.com", "*.login.microsoftonline.com"
+    "*.login.microsoftonline.com"
   ],
   "githubAuthDomains": [
-    "github.com", "api.github.com", "codeload.github.com", "ssh.github.com", "raw.githubusercontent.com"
+    "api.github.com", "codeload.github.com", "ssh.github.com", "raw.githubusercontent.com"
   ],
   "guardianTasks": [
     "AI-Stack-Guardian", "OW-Proxy-Guardian", "OW-Proxy-Startup", "FreeProxy-Refresh",

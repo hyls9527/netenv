@@ -89,7 +89,11 @@ proxies:
       ($out | Select-String -Pattern 'name: n1').Count | Should BeGreaterThan 0
       ($out | Select-String -Pattern 'name: n3').Count | Should BeGreaterThan 0
       @(Get-ClashProxyEntries $out).Count | Should Be 5
-      $out | Should Match 'DOMAIN-SUFFIX,github.com,DIRECT'
+      $out | Should Match 'DOMAIN-SUFFIX,api.github.com,DIRECT'
+      $out | Should Not Match 'DOMAIN-SUFFIX,github.com,DIRECT'
+      $out | Should Match 'mixed-port: 7890'
+      $out | Should Match 'port: 7897'
+      $out | Should Match 'external-controller: 127.0.0.1:19090'
       $out | Should Match 'name: auto-select'
       $out | Should Match 'DIRECT'
       $out | Should Match 'n3'

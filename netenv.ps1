@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
+if (-not $Rest) { $Rest = @() }
 
 . "$PSScriptRoot\lib\core.ps1"
 

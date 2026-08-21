@@ -16,7 +16,8 @@ function Invoke-NetEnvInstall {
   $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $localCfg -Encoding utf8
   if ($Autostart) {
     $action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-NoProfile -File `"$dest\lib\supervisor.ps1`""
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)).Repetition
     Register-ScheduledTask -TaskName 'NetEnv-Supervisor' -Action $action -Trigger $trigger -RunLevel Highest -Force | Out-Null
   }
   Write-NetEnvLog 'INFO' "install 完成: $dest"

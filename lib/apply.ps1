@@ -63,5 +63,11 @@ function Set-NetEnvProxyReg {
 
 function Set-NetEnvGitProxy {
   param([string]$Proxy)
-  if ($Proxy) { git config --global http.proxy $Proxy } else { git config --global --unset http.proxy 2>$null }
+  if ($Proxy) {
+    git config --global http.proxy $Proxy
+    git config --global --unset https.proxy 2>$null
+  } else {
+    git config --global --unset http.proxy 2>$null
+    git config --global --unset https.proxy 2>$null
+  }
 }

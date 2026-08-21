@@ -26,7 +26,15 @@ function Invoke-NetEnvAdopt {
   $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $cfg.guardianTasks -contains $_.TaskName -and $_.State -ne 'Disabled' }
   $startupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
   $startups = $cfg.startupItems | Where-Object { Test-Path -LiteralPath (Join-Path $startupDir $_) }
-  $oldProcs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and ($cfg.oldProcesses | Where-Object { $_.CommandLine -like "*$_*" }) }
+  $oldProcs = @()
+  foreach ($proc in (Get-CimInstance Win32_Process)) {
+    if ($proc.CommandLine -and $proc.CommandLine -match 'netenv\\data\\bin') { continue }
+    foreach ($pat in $cfg.oldProcesses) {
+      $namePat = ($pat -split '[\\/]')[-1]
+      $hit = ($proc.CommandLine -and $proc.CommandLine -like "*$pat*") -or ($namePat -and $proc.Name -like "*$namePat*")
+      if ($hit) { $oldProcs += $proc; break }
+    }
+  }
   $clientRows = Invoke-NetEnvClientsCheck
 
   $report = [ordered]@{
