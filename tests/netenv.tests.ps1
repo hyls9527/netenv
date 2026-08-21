@@ -50,3 +50,49 @@ rules:
     $out | Should Match 'name: n1'
   }
 }
+
+Describe '订阅合并' {
+  It '多源去重、敏感域名直连、auto-select 引用节点' {
+    $subDir = Join-Path $env:TEMP ('netenv-subtest-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Value @'
+mixed-port: 7890
+proxies:
+  - name: n1
+    type: vmess
+    server: 1.1.1.1
+  - name: n2
+    type: ss
+    server: 2.2.2.2
+  - name: "\U0001F534_n4"
+    type: vmess
+    server: 4.4.4.4
+rules:
+  - MATCH,auto
+'@ -Encoding utf8
+      Set-Content -LiteralPath (Join-Path $subDir 'b.yaml') -Value @'
+proxies:
+    - name: n1
+      type: vmess
+      server: 9.9.9.9
+    - name: n3
+      type: trojan
+      server: 3.3.3.3
+'@ -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      $out = Build-NetEnvMergedConfig $subDir $cfg
+      ($out | Select-String -Pattern 'name: n1').Count | Should BeGreaterThan 0
+      ($out | Select-String -Pattern 'name: n3').Count | Should BeGreaterThan 0
+      @(Get-ClashProxyEntries $out).Count | Should Be 4
+      $out | Should Match 'DOMAIN-SUFFIX,github.com,DIRECT'
+      $out | Should Match 'name: auto-select'
+      $out | Should Match 'DIRECT'
+      $out | Should Match 'n3'
+      $out | Should Not Match '""'
+      $out | Should Match '🔴_n4'
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
