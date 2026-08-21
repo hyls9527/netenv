@@ -41,7 +41,7 @@
   "subscription": {
     "urlTest": { "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50, "lazy": true }
   },
-  "supervisor": { "intervalMinutes": 5, "maxRestartPerRound": 3, "maxFailingRounds": 3 },
+  "supervisor": { "intervalMinutes": 1, "maxRestartPerRound": 3, "maxFailingRounds": 3 },
   "mcp": { "allowWrite": false },
   "logging": { "dir": "logs", "rotateDays": 30 },
   "secrets": {
