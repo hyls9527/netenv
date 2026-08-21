@@ -9,9 +9,16 @@ function Invoke-NetEnvBootstrap {
   foreach ($key in 'mihomo','newApi') {
     $bin = $cfg.binaries.$key
     $dest = Join-Path $paths.Bin $bin.filename
-    if ((Test-Path -LiteralPath $dest) -and -not $Force) { $results.Add("$key 已存在，跳过"); continue }
+    if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -gt $bin.minBytes -and -not $Force) { $results.Add("$key 已存在，跳过"); continue }
     try {
-      $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$($bin.source)/releases/latest" -Headers @{ 'User-Agent' = 'netenv' } -TimeoutSec 30
+      $release = $null
+      try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$($bin.source)/releases/latest" -Headers @{ 'User-Agent' = 'netenv' } -TimeoutSec 30
+      } catch {
+        $releaseJson = (& gh api "repos/$($bin.source)/releases/latest" 2>$null)
+        if ($releaseJson) { $release = $releaseJson | ConvertFrom-Json }
+      }
+      if (-not $release) { throw '无法获取 release 信息（匿名 API 限流且 gh 回退失败）' }
       $asset = $null
       if ($bin.assetPattern) {
         $asset = $release.assets | Where-Object { $_.name -match $bin.assetPattern } | Sort-Object name | Select-Object -First 1
@@ -35,8 +42,8 @@ function Invoke-NetEnvBootstrap {
         try {
           $errFile = Join-Path $paths.Logs 'bootstrap-curl.err'
           Set-Content -LiteralPath $errFile -Value ("URL=" + $m)
-          & curl.exe -sSL --fail --retry 2 --connect-timeout 15 --max-time 90 -o $downloadPath $m 2>> $errFile
-          if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $downloadPath) -and (Get-Item -LiteralPath $downloadPath).Length -gt 5000000) {
+          & curl.exe -sSL -C - --fail --retry 5 --retry-all-errors --connect-timeout 15 --max-time 300 -o $downloadPath $m 2>> $errFile
+          if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $downloadPath) -and (Get-Item -LiteralPath $downloadPath).Length -gt $bin.minBytes) {
             $ok = $true; break
           }
           $curlErr = if (Test-Path -LiteralPath $errFile) { (Get-Content -LiteralPath $errFile -Raw) } else { '' }
@@ -57,20 +64,20 @@ function Invoke-NetEnvBootstrap {
         } catch { }
       }
       if ($asset.name -like '*.zip') {
-        if (-not (Test-Path -LiteralPath $downloadPath) -or (Get-Item -LiteralPath $downloadPath).Length -lt 5000000) { throw "zip 未下载成功(镜像与 gh 通道均失败: $lastErr)" }
+        if (-not (Test-Path -LiteralPath $downloadPath) -or (Get-Item -LiteralPath $downloadPath).Length -lt $bin.minBytes) { throw "zip 未下载成功(镜像与 gh 通道均失败: $lastErr)" }
         $extractDir = Join-Path $paths.Bin ("_extract-" + [guid]::NewGuid().ToString('N').Substring(0,8))
         Expand-Archive -LiteralPath $downloadPath -DestinationPath $extractDir -Force
         Remove-Item -LiteralPath $downloadPath -Force
         $found = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter '*.exe' | Select-Object -First 1
         if ($found) {
-          if ($found.Length -lt 1000000) { throw '解包出的 exe 过小（疑似 HTML 错误页）' }
+          if ($found.Length -lt $bin.minBytes) { throw '解包出的 exe 过小（疑似 HTML 错误页）' }
           Move-Item -LiteralPath $found.FullName -Destination $dest -Force
           Remove-Item -LiteralPath $extractDir -Recurse -Force
         } else {
           throw 'zip 内未找到 exe'
         }
       } else {
-        if (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -lt 1000000) { throw "exe 未下载成功: $lastErr" }
+        if (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -lt $bin.minBytes) { throw "exe 未下载成功: $lastErr" }
       }
       $exe = Join-Path $paths.Bin $bin.filename
       $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash

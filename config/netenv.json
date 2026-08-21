@@ -49,8 +49,8 @@
     "archivePrefix": "NetEnv-密钥备份"
   },
   "binaries": {
-    "mihomo": { "source": "MetaCubeX/mihomo", "filename": "mihomo-windows-amd64.exe", "assetPattern": "windows-amd64-v1-.*\\.zip$" },
-    "subStore": { "source": "sub-store-org/Sub-Store", "filename": "sub-store.exe", "assetPattern": "" },
-    "newApi": { "source": "QuantumNous/new-api", "filename": "new-api.exe", "assetPattern": ".*\\.exe$" }
+    "mihomo": { "source": "MetaCubeX/mihomo", "filename": "mihomo-windows-amd64.exe", "assetPattern": "windows-amd64-[\\d.]+\\.zip$", "minBytes": 10000000 },
+    "subStore": { "source": "sub-store-org/Sub-Store", "filename": "sub-store.exe", "assetPattern": "", "minBytes": 1000000 },
+    "newApi": { "source": "QuantumNous/new-api", "filename": "new-api.exe", "assetPattern": ".*\\.exe$", "minBytes": 20000000 }
   }
 }

@@ -128,6 +128,10 @@ function Save-NetEnvSnapshot {
     label = $Label
     proxy = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue) | Select-Object ProxyEnable, ProxyServer, ProxyOverride
     gitProxy = (git config --global --get http.proxy 2>$null)
+    npm = [ordered]@{
+      proxy = (npm config get proxy 2>$null)
+      httpsProxy = (npm config get https-proxy 2>$null)
+    }
     env = @{}
   }
   foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy') {
