@@ -256,9 +256,12 @@ proxy-groups:
     proxies:
 $($groupNames -join "`n")
   - name: github-adaptive
+    # 选点依据必须是 github 自身端点：用通用 URL(google/gstatic) 会把 github.com 判给机场节点，
+    # 后果 1) github.com 经节点仍 30s；2) 认证流量经第三方免费节点（违反 docs/GITHUB-SAFETY.md）。
+    # 实测 github.com/robots.txt：直连 0.52s vs 经节点 1.55s -> 该组会自行选 DIRECT。
     type: url-test
-    url: $($Cfg.subscription.urlTest.url)
-    interval: 180
+    url: $(if ($Cfg.subscription.githubUrlTest.url) { $Cfg.subscription.githubUrlTest.url } else { 'https://github.com/robots.txt' })
+    interval: 120
     tolerance: 50
     lazy: true
     proxies:
