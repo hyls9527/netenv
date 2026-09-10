@@ -1,56 +1,157 @@
 {
-  "version": 1,
-  "mode": "portable",
-  "ports": {
-    "mihomoMixed": 7890,
-    "mihomoHttp": 7897,
-    "mihomoController": 19090,
-    "newApi": 8093,
-    "subStore": 8099
-  },
-  "profiles": {
-    "direct": { "systemProxy": false, "gitProxy": "", "npmProxy": "", "envProxy": false },
-    "proxy": { "systemProxy": true, "gitProxy": "http://127.0.0.1:7897", "npmProxy": "http://127.0.0.1:7897", "envProxy": true },
-    "github": { "systemProxy": false, "gitProxy": "http://127.0.0.1:7897", "npmProxy": "", "envProxy": false }
-  },
-  "noProxy": [
-    "localhost", "127.0.0.1", "::1",
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    "*.cn", "api.github.com", "codeload.github.com", "ssh.github.com"
-  ],
-  "sensitiveDomains": [
-    "*.bankofchina.com", "*.icbc.com.cn", "*.ccb.com", "*.abchina.com", "*.psbc.com", "*.cmbchina.com",
-    "*.qq.com/mail", "*.163.com/mail", "*.gmail.com", "*.outlook.com",
-    "*.login.microsoftonline.com"
-  ],
-  "githubAuthDomains": [
-    "api.github.com", "codeload.github.com", "ssh.github.com", "raw.githubusercontent.com"
-  ],
-  "guardianTasks": [
-    "AI-Stack-Guardian", "OW-Proxy-Guardian", "OW-Proxy-Startup", "FreeProxy-Refresh",
-    "Permafrost-Guardian", "Permafrost-Guardian-Logon", "VoiceGPT-Guardian", "DevSidecar-Guardian"
-  ],
-  "startupItems": [
-    "语音ChatGPT-开机启动.lnk", "start-agent-autostart.cmd", "run-ow-guardian.vbs", "run-voice-guardian.vbs",
-    "run-permafrost-guardian.vbs", "run-free-refresh.vbs", "start-ai-stack-hidden.vbs"
-  ],
-  "oldProcesses": [
-    "mihomo-windows-amd64", "gemini-web2api-go", "token-free-gateway-windows-x64",
-    "_tmp_openai_overwall\\voice_server.py", "_tmp_openai_overwall\\dsh-install"
-  ],
-  "subscription": {
-    "urlTest": { "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50, "lazy": true }
-  },
-  "supervisor": { "intervalMinutes": 1, "maxRestartPerRound": 3, "maxFailingRounds": 3 },
-  "mcp": { "allowWrite": false },
-  "logging": { "dir": "logs", "rotateDays": 30 },
-  "secrets": {
-    "archiveDir": "C:\\Users\\Admin\\Downloads",
-    "archivePrefix": "NetEnv-密钥备份"
-  },
-  "binaries": {
-    "mihomo": { "source": "MetaCubeX/mihomo", "filename": "mihomo-windows-amd64.exe", "assetPattern": "windows-amd64-[\\d.]+\\.zip$", "minBytes": 10000000 },
-    "subStore": { "source": "sub-store-org/Sub-Store", "filename": "sub-store.exe", "assetPattern": "", "minBytes": 1000000 },
-    "newApi": { "source": "QuantumNous/new-api", "filename": "new-api.exe", "assetPattern": ".*\\.exe$", "minBytes": 20000000 }
-  }
+    "mode":  "portable",
+    "ports":  {
+                  "mihomoMixed":  7890,
+                  "mihomoHttp":  7897,
+                  "mihomoController":  19090,
+                  "newApi":  8093,
+                  "subStore":  3001
+              },
+    "logging":  {
+                    "rotateDays":  14,
+                    "dir":  "logs"
+                },
+    "supervisor":  {
+                       "maxRestartPerRound":  2,
+                       "maxFailingRounds":  6,
+                       "intervalMinutes":  1
+                   },
+    "sensitiveDomains":  [
+                             "*.163.com/mail",
+                             "*.abchina.com",
+                             "*.bankofchina.com",
+                             "*.ccb.com",
+                             "*.cmbchina.com",
+                             "*.gmail.com",
+                             "*.icbc.com.cn",
+                             "*.login.microsoftonline.com",
+                             "*.outlook.com",
+                             "*.psbc.com",
+                             "*.qq.com/mail",
+                             "163.com",
+                             "abchina.com",
+                             "api.github.com",
+                             "bankofchina.com",
+                             "ccb.com",
+                             "cmbchina.com",
+                             "codeload.github.com",
+                             "icbc.com.cn",
+                             "login.microsoftonline.com",
+                             "outlook.com",
+                             "psbc.com",
+                             "qq.com",
+                             "release-assets.githubusercontent.com",
+                             "ssh.github.com"
+                         ],
+    "githubAuthDomains":  [
+                              "api.github.com",
+                              "codeload.github.com",
+                              "ssh.github.com",
+                              "raw.githubusercontent.com"
+                          ],
+    "githubAdaptiveDomains":  [
+                                  "github.com",
+                                  "objects.githubusercontent.com",
+                                  "raw.githubusercontent.com"
+                              ],
+    "subscription":  {
+                         "urlTest":  {
+                                         "url":  "https://www.google.com/generate_204",
+                                         "interval":  300,
+                                         "tolerance":  50,
+                                         "lazy":  true
+                                     }
+                     },
+    "noProxy":  [
+                    "*.cn",
+                    "::1",
+                    "\u003clocal\u003e",
+                    "10.*",
+                    "10.0.0.0/8",
+                    "127.*",
+                    "127.0.0.1",
+                    "172.16.*",
+                    "172.16.0.0/12",
+                    "192.168.*",
+                    "192.168.0.0/16",
+                    "api.github.com",
+                    "codeload.github.com",
+                    "localhost",
+                    "ssh.github.com"
+                ],
+    "profiles":  {
+                     "direct":  {
+                                    "systemProxy":  false,
+                                    "gitProxy":  "",
+                                    "envProxy":  false,
+                                    "npmProxy":  ""
+                                },
+                     "proxy":  {
+                                   "systemProxy":  true,
+                                   "gitProxy":  "http://127.0.0.1:7897",
+                                   "envProxy":  true,
+                                   "npmProxy":  "http://127.0.0.1:7897"
+                               },
+                     "github":  {
+                                    "systemProxy":  false,
+                                    "gitProxy":  "http://127.0.0.1:7897",
+                                    "envProxy":  false,
+                                    "npmProxy":  ""
+                                }
+                 },
+    "binaries":  {
+                     "mihomo":  {
+                                    "source":  "MetaCubeX/mihomo",
+                                    "filename":  "mihomo-windows-amd64.exe",
+                                    "minBytes":  40000000
+                                },
+                     "newApi":  {
+                                    "source":  "QuantumNous/new-api",
+                                    "filename":  "new-api.exe",
+                                    "minBytes":  100000000
+                                },
+                     "subStore":  {
+                                      "source":  "sub-store-org/Sub-Store",
+                                      "filename":  "sub-store.exe",
+                                      "assetPattern":  "",
+                                      "minBytes":  1000000
+                                  }
+                 },
+    "secrets":  {
+                    "archiveDir":  "backups\\secrets",
+                    "archivePrefix":  "netenv-secrets"
+                },
+    "optionalServices":  [
+                             "subStore"
+                         ],
+    "guardianTasks":  [
+                          "AI-Stack-Guardian",
+                          "OW-Proxy-Guardian",
+                          "OW-Proxy-Startup",
+                          "FreeProxy-Refresh",
+                          "Permafrost-Guardian",
+                          "Permafrost-Guardian-Logon",
+                          "VoiceGPT-Guardian",
+                          "DevSidecar-Guardian"
+                      ],
+    "startupItems":  [
+                         "语音ChatGPT-开机启动.lnk",
+                         "start-agent-autostart.cmd",
+                         "run-ow-guardian.vbs",
+                         "run-voice-guardian.vbs",
+                         "run-permafrost-guardian.vbs",
+                         "run-free-refresh.vbs",
+                         "start-ai-stack-hidden.vbs"
+                     ],
+    "oldProcesses":  [
+                         "mihomo-windows-amd64",
+                         "gemini-web2api-go",
+                         "token-free-gateway-windows-x64",
+                         "_tmp_openai_overwall\\voice_server.py",
+                         "_tmp_openai_overwall\\dsh-install"
+                     ],
+    "version":  1,
+    "mcp":  {
+                "allowWrite":  false
+            }
 }

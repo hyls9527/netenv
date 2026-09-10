@@ -1,4 +1,4 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 
 function Invoke-NetEnvDoctor {
   [CmdletBinding()]
@@ -15,14 +15,17 @@ function Invoke-NetEnvDoctor {
   }
 
   # 端口表
+  $optional = @($cfg.optionalServices)
   foreach ($p in $cfg.ports.PSObject.Properties) {
     $owner = Get-PortOwner $p.Value
     if ($owner) {
       $expected = @{ mihomoMixed='mihomo'; mihomoHttp='mihomo'; mihomoController='mihomo'; newApi='new-api'; subStore='sub-store' }
       $match = ($owner.Process -match ($expected[$p.Name] -replace '-','[-_]?')) -or ($owner.Path -match 'mihomo|new-api|sub-store')
       Add-Check "port.$($p.Name)" "端口 $($p.Value) ($($p.Name))" $match "被 $($owner.Process) (PID $($owner.Pid)) 占用$(if ($match) {'（符合预期）'} else {'（冲突：非 NetEnv 进程占用）'})"
+    } elseif ($optional -contains $p.Name) {
+      Add-Check "port.$($p.Name)" "端口 $($p.Value) ($($p.Name))" $true '未监听（可选服务未部署，跳过）'
     } else {
-      Add-Check "port.$($p.Name)" "端口 $($p.Value) ($($p.Name))" $false "未监听"
+      Add-Check "port.$($p.Name)" "端口 $($p.Value) ($($p.Name))" $false '未监听'
     }
   }
 
@@ -61,8 +64,12 @@ function Invoke-NetEnvDoctor {
     Add-Check "startup.$s" "旧自启动 $s" (-not (Test-Path -LiteralPath (Join-Path $startup $s))) '检查启动文件夹'
   }
 
-  # 旧代理进程（完整命令行匹配，防误判）
-  $procs = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -match '_tmp_openai_overwall|gemini-web2api|token-free-gateway|mihomo-windows-amd64' }
+  # 旧代理进程（完整命令行匹配，防误判；排除 netenv 自身进程）
+  $netenvRoot = (Get-NetEnvRoot)
+  $procs = @(Get-CimInstance Win32_Process | Where-Object {
+    $_.CommandLine -and $_.CommandLine -match '_tmp_openai_overwall|gemini-web2api|token-free-gateway|mihomo-windows-amd64' -and
+    $_.CommandLine -notmatch [regex]::Escape($netenvRoot)
+  })
   Add-Check 'oldprocs' '旧代理进程' ($procs.Count -eq 0) $(if ($procs.Count) { "仍有 $($procs.Count) 个旧进程(示例: $($procs[0].Name))" } else { '无' })
 
   # 其他代理进程（7890/7891/1080 类监听）
@@ -72,8 +79,12 @@ function Invoke-NetEnvDoctor {
   } | Sort-Object -Unique
   Add-Check 'otherproxy' '其他代理类监听(仅提示)' $true $(if ($other) { ($other -join ', ') } else { '无' })
 
-  # 本地网关健康
+  # 本地网关健康（可选服务未监听时跳过）
   foreach ($item in @(@{n='newApi';p=$cfg.ports.newApi}, @{n='subStore';p=$cfg.ports.subStore})) {
+    if ($optional -contains $item.n -and -not (Get-PortOwner $item.p)) {
+      Add-Check "gw.$($item.n)" "网关 $($item.n)" $true '未部署（可选服务，跳过）'
+      continue
+    }
     try {
       $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($item.p)/" -UseBasicParsing -TimeoutSec 3
       Add-Check "gw.$($item.n)" "网关 $($item.n)" $true "HTTP $($r.StatusCode)"

@@ -1,7 +1,29 @@
 [
-  { "id": "free-nodes", "name": "jichangx/free-nodes", "trusted": true },
-  { "id": "free-vpn-subs", "name": "Au1rxx/free-vpn-subscriptions", "trusted": true },
-  { "id": "freesub", "name": "cysk003/freeSub", "trusted": true },
-  { "id": "free-node", "name": "flik6/Free-Node", "trusted": true, "disabled": true, "note": "2026-08-21 clash.yaml 为 0 字节，已停用" },
-  { "id": "airport-free", "name": "xiaoji235/airport-free", "trusted": true }
+    {
+        "id":  "freesub",
+        "name":  "cysk003/freeSub",
+        "trusted":  true
+    },
+    {
+        "id":  "free-nodes",
+        "name":  "jichangx/free-nodes",
+        "trusted":  true
+    },
+    {
+        "id":  "airport-free",
+        "name":  "xiaoji235/airport-free",
+        "trusted":  true
+    },
+    {
+        "id":  "free-vpn-subs",
+        "name":  "Au1rxx/free-vpn-subscriptions",
+        "trusted":  true
+    },
+    {
+        "id":  "free-node",
+        "name":  "flik6/Free-Node",
+        "trusted":  true,
+        "disabled":  true,
+        "note":  "2026-08-21 clash.yaml 为 0 字节，已停用"
+    }
 ]

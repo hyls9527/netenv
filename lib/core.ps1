@@ -1,4 +1,4 @@
-$script:NetEnvRoot = Split-Path -Parent $PSScriptRoot
+﻿$script:NetEnvRoot = Split-Path -Parent $PSScriptRoot
 
 function Get-NetEnvRoot { return $script:NetEnvRoot }
 

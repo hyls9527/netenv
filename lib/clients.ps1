@@ -1,4 +1,4 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 
 function Invoke-NetEnvClientsCheck {
   $rows = [System.Collections.Generic.List[object]]::new()

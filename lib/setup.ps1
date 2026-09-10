@@ -1,4 +1,4 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 . "$PSScriptRoot\doctor.ps1"
 . "$PSScriptRoot\apply.ps1"
 . "$PSScriptRoot\nodes.ps1"

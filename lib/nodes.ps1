@@ -1,4 +1,4 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 
 function Ensure-NetEnvGeoIP {
   $paths = Get-NetEnvPaths
@@ -170,9 +170,14 @@ function Build-NetEnvMergedConfig {
   $byName = @{}
   $order = [System.Collections.Generic.List[string]]::new()
   foreach ($f in $files) {
-    $text = Get-Content -LiteralPath $f.FullName -Raw
+    $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8
     foreach ($e in (Get-ClashProxyEntries $text)) {
       if ($e -notmatch '(?m)^\s+-\s+(name|cipher)\s*:') { continue }
+      # mihomo 对非法 REALITY public-key 会整包拒绝加载，构建期直接剔除
+      if ($e -match 'reality-opts') {
+        $pk = [regex]::Match($e, '(?m)^\s+public-key\s*:\s*(\S+)').Groups[1].Value
+        if ($pk -notmatch '^[A-Za-z0-9_-]{43}$') { continue }
+      }
       $m = [regex]::Match($e, '(?m)^\s+(?:-\s+)?name\s*:\s*(.+?)\s*$')
       if ($m.Success) {
         $name = $m.Groups[1].Value.Trim()
@@ -182,7 +187,7 @@ function Build-NetEnvMergedConfig {
           $name = $name.Substring(1, $name.Length - 2)
         }
         $name = ConvertFrom-YamlEscapedName $name
-        if ($name -and -not $byName.ContainsKey($name)) {
+        if ($name -and -not $byName.ContainsKey($name) -and $name -notmatch 'https?://|电报群|日期：|免费VPN|剩余|到期|官网|套餐|expire') {
           $byName[$name] = $e
           $order.Add($name)
         }
@@ -202,6 +207,14 @@ function Build-NetEnvMergedConfig {
   }
   $ruleLines = foreach ($dom in $directDomains) { "    - DOMAIN-SUFFIX,$dom,DIRECT" }
   $ruleText = $ruleLines -join "`n"
+
+  $adaptiveDomains = @()
+  foreach ($d in @($Cfg.githubAdaptiveDomains)) {
+    $dom = (($d -replace '^\*\.', '') -split '/')[0]
+    if ($dom -and ($adaptiveDomains -notcontains $dom)) { $adaptiveDomains += $dom }
+  }
+  $adaptiveRuleLines = foreach ($dom in $adaptiveDomains) { "    - DOMAIN-SUFFIX,$dom,github-adaptive" }
+  $adaptiveRuleText = $adaptiveRuleLines -join "`n"
 
   $groupNames = foreach ($n in $order) {
     $esc = $n.Replace('\', '\\').Replace('"', '\"')
@@ -229,18 +242,34 @@ dns:
 proxies:
 $proxiesBlock
 proxy-groups:
-  - name: auto-select
+  - name: proxy-select
+    type: select
+    proxies:
+      - auto-urltest
+      - DIRECT
+  - name: auto-urltest
     type: url-test
     url: $($Cfg.subscription.urlTest.url)
     interval: $($Cfg.subscription.urlTest.interval)
-    tolerance: $($Cfg.subscription.urlTest.tolerance)
+    tolerance: 150
     lazy: $($Cfg.subscription.urlTest.lazy.ToString().ToLower())
     proxies:
 $($groupNames -join "`n")
+  - name: github-adaptive
+    type: url-test
+    url: $($Cfg.subscription.urlTest.url)
+    interval: 180
+    tolerance: 50
+    lazy: true
+    proxies:
+      - proxy-select
+      - DIRECT
 rules:
 $ruleText
-    - GEOIP,CN,DIRECT
-    - MATCH,auto-select
+$adaptiveRuleText
+    - GEOSITE,cn,DIRECT
+    - GEOIP,CN,DIRECT,no-resolve
+    - MATCH,proxy-select
 "@
   return $merged
 }

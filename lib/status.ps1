@@ -1,4 +1,4 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 
 function Get-NetEnvStatus {
   param([switch]$Json)

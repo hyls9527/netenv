@@ -1,10 +1,10 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 
 $script:GithubTokenPattern = 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}'
 
 function Get-NetEnvSecretTargets {
   $targets = [System.Collections.Generic.List[string]]::new()
-  $overwall = 'C:\Users\Admin\Desktop\Vibe coding\_tmp_openai_overwall'
+  $overwall = Join-Path (Get-NetEnvRoot) '_tmp_openai_overwall'
   if (Test-Path -LiteralPath $overwall) {
     Get-ChildItem -LiteralPath $overwall -File -Force -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -match '(account|cookie|subscription|token|secret|auth|key|proxies|known-good|nodes)' } |

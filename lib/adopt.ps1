@@ -1,4 +1,4 @@
-. "$PSScriptRoot\core.ps1"
+﻿. "$PSScriptRoot\core.ps1"
 . "$PSScriptRoot\clients.ps1"
 
 function Invoke-NetEnvAdopt {
@@ -51,7 +51,7 @@ function Invoke-NetEnvAdopt {
 
   if ($Apply) {
     if (-not (Test-IsAdmin)) { throw 'adopt -Apply 需要管理员权限' }
-    $overwall = 'C:\Users\Admin\Desktop\Vibe coding\_tmp_openai_overwall'
+    $overwall = Join-Path (Get-NetEnvRoot) '_tmp_openai_overwall'
     if (Test-Path -LiteralPath $overwall) {
       if (-not $Password) {
         $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789#!%'
