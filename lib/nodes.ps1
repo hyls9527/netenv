@@ -294,6 +294,7 @@ proxy-groups:
     type: select
     proxies:
       - auto-urltest
+      - github-node
       - DIRECT
   - name: auto-urltest
     type: url-test
@@ -301,6 +302,17 @@ proxy-groups:
     interval: $($Cfg.subscription.urlTest.interval)
     tolerance: 150
     lazy: $($Cfg.subscription.urlTest.lazy.ToString().ToLower())
+    proxies:
+$($groupNames -join "`n")
+  # github 专用节点池：同一批节点，但用 github 自身端点甄选。
+  # 必要性：通用组按 google 选点，而"能通 google"的节点未必能完成 github 的 TLS 会话
+  # （实测同一节点 google 204 而 github TLS 失败；全池 423 节点中仅 11 个能到 github 端点）。
+  - name: github-node
+    type: url-test
+    url: $(if ($Cfg.subscription.githubUrlTest.url) { $Cfg.subscription.githubUrlTest.url } else { 'https://github.com/robots.txt' })
+    interval: $(if ($Cfg.subscription.githubUrlTest.interval) { $Cfg.subscription.githubUrlTest.interval } else { 60 })
+    tolerance: 100
+    lazy: true
     proxies:
 $($groupNames -join "`n")
   - name: github-adaptive
@@ -313,6 +325,7 @@ $($groupNames -join "`n")
     tolerance: 50
     lazy: true
     proxies:
+      - github-node
       - proxy-select
       - DIRECT
 rules:

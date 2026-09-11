@@ -274,7 +274,8 @@ function Test-NetEnvEgress {
   param(
     [string]$ProbeUrl,
     [int]$TimeoutSec = 8,
-    [int]$ProxyPort
+    [int]$ProxyPort,
+    [switch]$VerifyCert
   )
   $cfg = Read-NetEnvConfig -Quiet
   if (-not $ProbeUrl) {
@@ -285,6 +286,24 @@ function Test-NetEnvEgress {
     if ($cfg -and $cfg.ports -and $cfg.ports.mihomoHttp) { $ProxyPort = [int]$cfg.ports.mihomoHttp } else { $ProxyPort = 7897 }
   }
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+  # -VerifyCert：走 curl 真实校验证书。必要性：免费出口节点常呈现过期/伪造证书
+  # （实测同一节点 curl -k 能拿到 401，而默认校验报 SEC_E_CERT_EXPIRED），
+  # 而 mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康。
+  if ($VerifyCert) {
+    $out = & curl.exe -sS -o NUL -w '%{http_code}' -x ("http://127.0.0.1:$ProxyPort") --connect-timeout $TimeoutSec --max-time ($TimeoutSec * 3) $ProbeUrl 2>&1
+    $sw.Stop()
+    $code = ($out -join '')
+    $ok = ($code -match '^\d{3}$')
+    return [PSCustomObject]@{
+      Ok    = $ok
+      Status = if ($ok) { [int]$code } else { 0 }
+      Ms    = $sw.ElapsedMilliseconds
+      Url   = $ProbeUrl
+      Error = if ($ok) { $null } else { $code }
+    }
+  }
+
   try {
     $r = Invoke-WebRequest -Uri $ProbeUrl -Proxy ("http://127.0.0.1:$ProxyPort") -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
     $sw.Stop()

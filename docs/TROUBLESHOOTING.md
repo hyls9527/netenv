@@ -38,3 +38,17 @@
   7-Zip 用 `a -t7z -p<pw> -mhe=on`；Bandizip 用 `a -fmt:7z -p:<pw>`（其 7z 加密头默认开启，实测无密码无法列出条目名）。
 - **代理端口在听但打不开网页**：先跑 `netenv doctor`，看 `端到端出品（经代理实测）` 这一项。
   它走真实请求，能区分"进程活着"与"出口可用"；`data/health-state.json` 记录连续失败次数。
+- **`SEC_E_CERT_EXPIRED` / `schannel: failed to receive handshake` / `SSL routines::unexpected eof`**：
+  免费出口节点呈现的证书无效或会话被中断。诊断要点（实测得出）：
+  - `curl -k`（跳过校验）若返回正常状态码 → **隧道是通的，问题在证书**，不是网络封禁；
+  - mihomo 内部探针**不校验证书**，所以它会对同一节点报 200 —— 不要用它的结论判断"能否访问 github"；
+  - 两者结合可判定该节点是否在**中间人（MITM）**；
+  - 处理：换节点（`github-node` 组会按 github 端点重新甄选）或重试（同一操作换节点后往往直接成功）。
+  这也是 `api.github.com` / `codeload.github.com` / `ssh.github.com` 保持 `DIRECT` 的原因：
+  凭据不该交给证书不可信的出口。
+- **`github.com` 时通时不通，而 google 一直正常**：通用组按 google 选点，但"能通 google"的节点未必能完成
+  github 的 TLS 会话（实测同一节点 google 204 而 github 证书校验失败；423 节点中仅 11 个能到 github 端点）。
+  已由 `github-node` 组（用 github 自身端点甄选）解决。
+- **`gitclone.com` 等镜像不能用于 git 操作**：实测其 git 端点返回 502（首页 132ms 可达具有误导性），
+  且走镜像需把 token 交给第三方，安全上不可接受。`gh-proxy` 系列只能加速**单文件 HTTP 下载**（实测 raw 200），
+  不是 git 协议。因此 git 层面只有"直连 / 经节点"两条路。

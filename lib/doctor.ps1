@@ -138,8 +138,12 @@ function Invoke-NetEnvDoctor {
   if (Get-PortOwner $cfg.ports.mihomoHttp) {
     $eg = Test-NetEnvEgress -TimeoutSec 10
     Add-Check 'egress' '端到端出品（经代理实测）' $eg.Ok $(if ($eg.Ok) { "HTTP $($eg.Status) in $($eg.Ms)ms" } else { "不可用: $($eg.Error)" })
+    # 证书校验：mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康
+    $cert = Test-NetEnvEgress -ProbeUrl 'https://github.com/robots.txt' -TimeoutSec 10 -VerifyCert
+    Add-Check 'certverify' '出口证书可信（非 MITM）' $cert.Ok $(if ($cert.Ok) { "HTTP $($cert.Status) in $($cert.Ms)ms（证书有效）" } else { "证书校验失败（节点可能呈现伪造/过期证书）: $($cert.Error)" })
   } else {
     Add-Check 'egress' '端到端出品（经代理实测）' $true 'mihomo 未监听，跳过'
+    Add-Check 'certverify' '出口证书可信（非 MITM）' $true 'mihomo 未监听，跳过'
   }
 
   if ($Json) {
