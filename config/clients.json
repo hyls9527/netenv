@@ -3,7 +3,7 @@
     "id": "codex",
     "name": "Codex",
     "baseUrl": "http://127.0.0.1:8093/v1",
-    "configPaths": ["C:\\Users\\Admin\\.codex\\config.toml"],
+    "configPaths": ["%USERPROFILE%\\.codex\\config.toml"],
     "envVars": ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"],
     "restartRequired": true
   },

@@ -3,27 +3,27 @@
 $script:GithubTokenPattern = 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}'
 
 function Get-NetEnvSecretTargets {
-  $targets = [System.Collections.Generic.List[string]]::new()
+  $targets = (New-Object System.Collections.Generic.List[string])
   $overwall = Join-Path (Get-NetEnvRoot) '_tmp_openai_overwall'
   if (Test-Path -LiteralPath $overwall) {
     Get-ChildItem -LiteralPath $overwall -File -Force -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -match '(account|cookie|subscription|token|secret|auth|key|proxies|known-good|nodes)' } |
       ForEach-Object { $targets.Add($_.FullName) }
   }
-  $codex = 'C:\Users\Admin\.codex'
+  $codex = Join-Path $env:USERPROFILE '.codex'
   if (Test-Path -LiteralPath $codex) {
     Get-ChildItem -LiteralPath $codex -File -Force -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -eq '.env' -or $_.Name -like 'config.toml.bak-*' } |
       ForEach-Object { $targets.Add($_.FullName) }
   }
-  $dsh = 'C:\Users\Admin\.dsh'
+  $dsh = Join-Path $env:USERPROFILE '.dsh'
   if (Test-Path -LiteralPath $dsh) {
     foreach ($n in '.credentials.yaml', '.env') {
       $p = Join-Path $dsh $n
       if (Test-Path -LiteralPath $p) { $targets.Add($p) }
     }
   }
-  $twofa = 'C:\Users\Admin\Downloads\GitHub 双重验证，扩展备份。authenticator.txt'
+  $twofa = Join-Path (Join-Path $env:USERPROFILE 'Downloads') 'GitHub 双重验证，扩展备份。authenticator.txt'
   if (Test-Path -LiteralPath $twofa) { $targets.Add($twofa) }
   return @($targets | Select-Object -Unique)
 }
@@ -36,7 +36,7 @@ function Get-TokenFingerprint {
 
 function Invoke-NetEnvSecretsScan {
   param([switch]$Github)
-  $rows = [System.Collections.Generic.List[object]]::new()
+  $rows = (New-Object System.Collections.Generic.List[object])
   foreach ($f in (Get-NetEnvSecretTargets)) {
     $kind = 'file'
     $tokenCount = 0
@@ -85,20 +85,20 @@ function Invoke-NetEnvSecretsArchive {
     $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
     $bytes = New-Object byte[] 20
     $rng.GetBytes($bytes)
-    $sb = [Text.StringBuilder]::new()
+    $sb = (New-Object Text.StringBuilder)
     foreach ($b in $bytes) { $null = $sb.Append($chars[$b % $chars.Length]) }
     $Password = $sb.ToString()
   }
 
   $staging = Join-Path $env:TEMP ("netenv-secrets-" + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $staging | Out-Null
-  $manifest = [System.Collections.Generic.List[object]]::new()
-  $skipped = [System.Collections.Generic.List[object]]::new()
+  $manifest = (New-Object System.Collections.Generic.List[object])
+  $skipped = (New-Object System.Collections.Generic.List[object])
   try {
     foreach ($f in (Get-NetEnvSecretTargets)) {
       $name = (Split-Path $f -Leaf)
       $dest = Join-Path $staging $name
-      if ((Split-Path $f -Parent) -eq 'C:\Users\Admin\Downloads') { $dest = Join-Path $staging ("2FA-" + $name) }
+      if ((Split-Path $f -Parent) -eq (Join-Path $env:USERPROFILE 'Downloads')) { $dest = Join-Path $staging ("2FA-" + $name) }
       try {
         Copy-Item -LiteralPath $f -Destination $dest -Force -ErrorAction Stop
         $hash = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
@@ -122,8 +122,8 @@ function Invoke-NetEnvSecretsArchive {
 
     $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
     $archive = Join-Path $ArchiveDir "$($cfg.secrets.archivePrefix)-$ts.7z"
-    $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
-    if (-not (Test-Path -LiteralPath $sevenZip)) { throw '未找到 7-Zip: C:\Program Files\7-Zip\7z.exe' }
+    $sevenZip = Get-NetEnvSevenZip
+    if (-not $sevenZip) { throw '未找到 7z 可执行文件（请安装 7-Zip，或用已安装的 Bandizip）' }
     & $sevenZip a -t7z "-p$Password" -mhe=on $archive (Join-Path $staging '*') | Out-Null
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archive)) { throw '7z 打包失败' }
 
@@ -147,7 +147,7 @@ function Invoke-NetEnvSecretsPurge {
   param([switch]$GithubExpired)
   if (-not $GithubExpired) { throw "purge 只支持 --github-expired（其他清理请先归档）" }
   $cfg = Read-NetEnvConfig
-  $report = [System.Collections.Generic.List[object]]::new()
+  $report = (New-Object System.Collections.Generic.List[object])
   foreach ($f in (Get-NetEnvSecretTargets)) {
     $raw = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue
     if (-not $raw) { continue }

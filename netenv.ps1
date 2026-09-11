@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)][string]$Command,

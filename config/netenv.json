@@ -51,8 +51,7 @@
                           ],
     "githubAdaptiveDomains":  [
                                   "github.com",
-                                  "objects.githubusercontent.com",
-                                  "raw.githubusercontent.com"
+                                  "objects.githubusercontent.com"
                               ],
     "subscription":  {
                          "urlTest":  {
@@ -60,7 +59,13 @@
                                          "interval":  300,
                                          "tolerance":  50,
                                          "lazy":  true
-                                     }
+                                     },
+                         "githubUrlTest":  {
+                                               "url":  "https://github.com/robots.txt",
+                                               "interval":  120,
+                                               "tolerance":  50,
+                                               "lazy":  true
+                                           }
                      },
     "noProxy":  [
                     "*.cn",

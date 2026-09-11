@@ -43,6 +43,9 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 - **订阅仅 HTTPS**，剥离 `script` 等危险字段；订阅 URL 存 Windows 凭据管理器，不入盘
 - **代理面不对外**：mihomo 的 `mixed-port` / `http` / `external-controller` 均绑定 `127.0.0.1`，`allow-lan: false`
 - **`.ps1` 一律带 UTF-8 BOM**：脚本含中文，且计划任务以 `powershell.exe`（Windows PowerShell 5.1）`-File` 方式执行；无 BOM 时 5.1 会按 ANSI/GBK 解码导致中文乱码。**改动任何 `.ps1` 后请复查 BOM。**
+- **兼容 Windows PowerShell 5.1**：环境可能只有 `powershell.exe` 而无 `pwsh.exe`。因此脚本内**不得使用 PS7 专属语法**（`::new()` 构造、`??`、三元 `? :`、`-Parallel` 等），统一用 `New-Object` 与显式 `if/else`。
+- **路径全部通用化**：不写死用户名或安装盘符 —— 用户目录用 `$env:USERPROFILE`，仓库内部用 `$PSScriptRoot` 推导，外部工具（7z）用 `Get-NetEnvSevenZip` 探测，客户端注入点用 `%USERPROFILE%` 占位符。换机只需改 `config/netenv.json`。
+- **可选外部依赖缺失必须降级而非崩溃**：`npm`、`gh`、7-Zip 等未安装时跳过该步并记 WARN；在 `$ErrorActionPreference='Stop'` 下直接调用不存在的命令会终止整条流程。
 
 ## 常驻与自愈
 

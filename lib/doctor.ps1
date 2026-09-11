@@ -5,7 +5,7 @@ function Invoke-NetEnvDoctor {
   param([switch]$Json, [switch]$NoExit)
 
   $cfg = Read-NetEnvConfig
-  $checks = [System.Collections.Generic.List[object]]::new()
+  $checks = (New-Object System.Collections.Generic.List[object])
   $script:fails = 0
 
   function Add-Check {
@@ -47,9 +47,13 @@ function Invoke-NetEnvDoctor {
   # git / npm
   $gitProxy = git config --global --get http.proxy 2>$null
   Add-Check 'gitproxy' 'git 全局代理' ($null -eq $gitProxy -or $gitProxy -match '127.0.0.1:7897') ("http.proxy=$(ConvertTo-Redacted $gitProxy)")
-  $npmProxy = npm config get proxy 2>$null
-  $npmHttps = npm config get https-proxy 2>$null
-  Add-Check 'npmproxy' 'npm 代理' (($null -eq $npmProxy -or $npmProxy -eq 'null' -or $npmProxy -match '7897') -and ($null -eq $npmHttps -or $npmHttps -eq 'null' -or $npmHttps -match '7897')) ("proxy=$npmProxy https=$npmHttps")
+  if (Get-Command npm -ErrorAction SilentlyContinue) {
+    $npmProxy = npm config get proxy 2>$null
+    $npmHttps = npm config get https-proxy 2>$null
+    Add-Check 'npmproxy' 'npm 代理' (($null -eq $npmProxy -or $npmProxy -eq 'null' -or $npmProxy -match '7897') -and ($null -eq $npmHttps -or $npmHttps -eq 'null' -or $npmHttps -match '7897')) ("proxy=$npmProxy https=$npmHttps")
+  } else {
+    Add-Check 'npmproxy' 'npm 代理' $true '未安装 npm（跳过）'
+  }
 
   # 旧 guardian 计划任务
   $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue

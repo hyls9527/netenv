@@ -87,7 +87,7 @@ function Write-NetEnvLog {
 
 function Test-IsAdmin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-  return ([Security.Principal.WindowsPrincipal]::new($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Get-PortOwner {
@@ -123,14 +123,15 @@ function Save-NetEnvSnapshot {
   $paths = Get-NetEnvPaths
   $snapDir = Join-Path $paths.Backups 'snapshots'
   if (-not (Test-Path -LiteralPath $snapDir)) { New-Item -ItemType Directory -Path $snapDir -Force | Out-Null }
+  $hasNpm = [bool](Get-Command npm -ErrorAction SilentlyContinue)
   $snap = [ordered]@{
     time = (Get-Date -Format 's')
     label = $Label
     proxy = (Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue) | Select-Object ProxyEnable, ProxyServer, ProxyOverride
     gitProxy = (git config --global --get http.proxy 2>$null)
     npm = [ordered]@{
-      proxy = (npm config get proxy 2>$null)
-      httpsProxy = (npm config get https-proxy 2>$null)
+      proxy = if ($hasNpm) { (npm config get proxy 2>$null) } else { $null }
+      httpsProxy = if ($hasNpm) { (npm config get https-proxy 2>$null) } else { $null }
     }
     env = @{}
   }
@@ -146,6 +147,23 @@ function Get-NetEnvSnapshot {
   param([Parameter(Mandatory)][string]$File)
   if (-not (Test-Path -LiteralPath $File)) { throw "快照不存在: $File" }
   return (Get-Content -LiteralPath $File -Raw | ConvertFrom-Json)
+}
+
+# 解析 7z 可执行文件（不写死安装路径；缺失时返回 $null，由调用方决定是否报错）
+function Get-NetEnvSevenZip {
+  $cands = @(
+    (Join-Path $env:ProgramFiles '7-Zip\7z.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\7-Zip\7z.exe'),
+    (Join-Path $env:ProgramFiles 'Bandizip\bz.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Bandizip\bz.exe')
+  )
+  foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+  foreach ($n in '7z', '7za', 'bz') {
+    $cmd = Get-Command $n -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+  }
+  return $null
 }
 
 function Get-GithubTokenStatus {

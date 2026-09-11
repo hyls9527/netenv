@@ -21,8 +21,10 @@ function Invoke-NetEnvApply {
     Set-NetEnvGitProxy $snap.gitProxy
     $npmProxy = if ($snap.npm) { $snap.npm.proxy } else { 'null' }
     $npmHttps = if ($snap.npm) { $snap.npm.httpsProxy } else { 'null' }
-    npm config set proxy $npmProxy 2>$null | Out-Null
-    npm config set https-proxy $npmHttps 2>$null | Out-Null
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+      npm config set proxy $npmProxy 2>$null | Out-Null
+      npm config set https-proxy $npmHttps 2>$null | Out-Null
+    }
     foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY') {
       [Environment]::SetEnvironmentVariable($n, $snap.env.$n, 'User')
     }
@@ -39,8 +41,12 @@ function Invoke-NetEnvApply {
   Set-NetEnvGitProxy $prof.gitProxy
 
   $npmProxy = if ($prof.npmProxy) { $prof.npmProxy } else { 'null' }
-  npm config set proxy $npmProxy 2>$null | Out-Null
-  npm config set https-proxy $npmProxy 2>$null | Out-Null
+  if (Get-Command npm -ErrorAction SilentlyContinue) {
+    npm config set proxy $npmProxy 2>$null | Out-Null
+    npm config set https-proxy $npmProxy 2>$null | Out-Null
+  } else {
+    Write-NetEnvLog 'WARN' 'apply: 未找到 npm，跳过 npm 代理注入'
+  }
 
   foreach ($n in 'HTTP_PROXY','HTTPS_PROXY') {
     $val = if ($prof.envProxy) { 'http://127.0.0.1:7897' } else { $null }

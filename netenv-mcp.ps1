@@ -1,4 +1,4 @@
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
+﻿[Console]::OutputEncoding = [Text.Encoding]::UTF8
 [Console]::InputEncoding = [Text.Encoding]::UTF8
 $ErrorActionPreference = 'Stop'
 

@@ -89,7 +89,7 @@ function Invoke-NetEnvNodesRefresh {
 function Remove-NetEnvDangerousFields {
   param([string]$Yaml)
   $lines = $Yaml -split "`r?`n"
-  $out = [System.Collections.Generic.List[string]]::new()
+  $out = (New-Object System.Collections.Generic.List[string])
   $skipBlock = $false
   foreach ($line in $lines) {
     $line = $line -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', ''
@@ -108,17 +108,17 @@ function Remove-NetEnvDangerousFields {
 
 function Get-ClashProxyEntries {
   param([string]$Yaml)
-  $entries = [System.Collections.Generic.List[string]]::new()
+  $entries = (New-Object System.Collections.Generic.List[string])
   $lines = $Yaml -split "`r?`n"
   $inProxies = $false
-  $cur = [System.Collections.Generic.List[string]]::new()
+  $cur = (New-Object System.Collections.Generic.List[string])
   foreach ($line in $lines) {
     if (-not $inProxies -and $line -match '^\s*proxies\s*:') { $inProxies = $true; continue }
     if (-not $inProxies) { continue }
     if ($line -match '^\S') { break }
     if ($line -match '^\s+-\s+') {
       if ($cur.Count -gt 0) { $entries.Add(($cur -join "`n")) }
-      $cur = [System.Collections.Generic.List[string]]::new()
+      $cur = (New-Object System.Collections.Generic.List[string])
       $cur.Add($line)
     } elseif ($cur.Count -gt 0) {
       $cur.Add($line)
@@ -138,7 +138,7 @@ function ConvertTo-NetEnvNormalizedEntry {
       break
     }
   }
-  $out = [System.Collections.Generic.List[string]]::new()
+  $out = (New-Object System.Collections.Generic.List[string])
   foreach ($line in $lines) {
     if ($line.Trim() -eq '') { $out.Add(''); continue }
     $m = [regex]::Match($line, '^(\s*)(.*)$')
@@ -168,7 +168,7 @@ function Build-NetEnvMergedConfig {
   if ($files.Count -eq 0) { return '' }
 
   $byName = @{}
-  $order = [System.Collections.Generic.List[string]]::new()
+  $order = (New-Object System.Collections.Generic.List[string])
   foreach ($f in $files) {
     $text = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8
     foreach ($e in (Get-ClashProxyEntries $text)) {
@@ -196,7 +196,7 @@ function Build-NetEnvMergedConfig {
   }
   if ($order.Count -eq 0) { return '' }
 
-  $proxiesLines = [System.Collections.Generic.List[string]]::new()
+  $proxiesLines = (New-Object System.Collections.Generic.List[string])
   foreach ($n in $order) { $proxiesLines.Add((ConvertTo-NetEnvNormalizedEntry $byName[$n])) }
   $proxiesBlock = ($proxiesLines -join "`n")
 
@@ -229,6 +229,29 @@ mode: rule
 log-level: info
 ipv6: false
 external-controller: 127.0.0.1:$($Cfg.ports.mihomoController)
+# sniffer：按 TLS SNI / HTTP Host 还原真实域名后再匹配规则。
+# 必要性：本地 DNS 对 github.com / www.google.com 等存在投毒（实测 github.com 被解析到不可达 IP
+# 20.205.243.166，而真实 IP 140.82.112.3 可通），仅靠 IP 分流会判错目标。
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    HTTP:
+      ports:
+        - 80
+        - 8080-8880
+      override-destination: true
+    TLS:
+      ports:
+        - 443
+        - 8443
+      override-destination: true
+    QUIC:
+      ports:
+        - 443
+        - 8443
 dns:
   enable: true
   enhanced-mode: fake-ip

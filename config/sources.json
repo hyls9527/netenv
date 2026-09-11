@@ -1,4 +1,4 @@
-[
+﻿[
     {
         "id":  "freesub",
         "name":  "cysk003/freeSub",
@@ -24,6 +24,11 @@
         "name":  "flik6/Free-Node",
         "trusted":  true,
         "disabled":  true,
-        "note":  "2026-08-21 clash.yaml 为 0 字节，已停用"
+        "note":  "2026-08-21 clash.yaml 涓?0 瀛楄妭锛屽凡鍋滅敤"
+    },
+    {
+        "id":  "wjkc",
+        "name":  "wj-kc 机场(付费/原订阅)",
+        "trusted":  true
     }
 ]

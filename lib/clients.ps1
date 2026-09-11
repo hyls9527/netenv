@@ -1,7 +1,14 @@
 ﻿. "$PSScriptRoot\core.ps1"
 
+function Expand-NetEnvPath {
+  # 展开 %VAR% / $env:VAR，使 config/clients.json 可写通用路径（不绑死用户名）
+  param([string]$Path)
+  if (-not $Path) { return $Path }
+  return [Environment]::ExpandEnvironmentVariables($Path)
+}
+
 function Invoke-NetEnvClientsCheck {
-  $rows = [System.Collections.Generic.List[object]]::new()
+  $rows = (New-Object System.Collections.Generic.List[object])
   foreach ($c in (Read-NetEnvJson -Name 'clients')) {
     $ok = $false
     $detail = ''
@@ -21,10 +28,12 @@ function Invoke-NetEnvClientsCheck {
 
 function Invoke-NetEnvClientsApply {
   $cfg = Read-NetEnvConfig
-  $written = [System.Collections.Generic.List[string]]::new()
+  $written = (New-Object System.Collections.Generic.List[string])
   foreach ($c in (Read-NetEnvJson -Name 'clients')) {
-    foreach ($p in $c.configPaths) {
-      if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+    foreach ($rawPath in $c.configPaths) {
+      if (-not $rawPath) { continue }
+      $p = Expand-NetEnvPath $rawPath
+      if (-not (Test-Path -LiteralPath $p)) { continue }
       $dir = Split-Path $p -Parent
       $envFile = Join-Path $dir 'NetEnv.env'
       $content = @"

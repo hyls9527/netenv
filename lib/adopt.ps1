@@ -56,11 +56,12 @@ function Invoke-NetEnvAdopt {
       if (-not $Password) {
         $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789#!%'
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); $bytes = New-Object byte[] 20; $rng.GetBytes($bytes)
-        $sb = [Text.StringBuilder]::new(); foreach ($b in $bytes) { $null = $sb.Append($chars[$b % $chars.Length]) }
+        $sb = (New-Object Text.StringBuilder); foreach ($b in $bytes) { $null = $sb.Append($chars[$b % $chars.Length]) }
         $Password = $sb.ToString()
       }
       $archive = Join-Path $paths.Backups "adopt-overwall-$ts.7z"
-      $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+      $sevenZip = Get-NetEnvSevenZip
+      if (-not $sevenZip) { throw '未找到 7z 可执行文件（请安装 7-Zip，或用已安装的 Bandizip）' }
       & $sevenZip a -t7z "-p$Password" -mhe=on $archive "$overwall\*" | Out-Null
       $report.overwallArchive = $archive
     }

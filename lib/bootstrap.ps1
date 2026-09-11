@@ -5,7 +5,7 @@ function Invoke-NetEnvBootstrap {
   $cfg = Read-NetEnvConfig
   $paths = Get-NetEnvPaths
   if (-not (Test-Path -LiteralPath $paths.Bin)) { New-Item -ItemType Directory -Path $paths.Bin -Force | Out-Null }
-  $results = [System.Collections.Generic.List[object]]::new()
+  $results = (New-Object System.Collections.Generic.List[object])
   foreach ($key in 'mihomo','newApi') {
     $bin = $cfg.binaries.$key
     $dest = Join-Path $paths.Bin $bin.filename
