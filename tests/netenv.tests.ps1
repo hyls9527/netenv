@@ -349,3 +349,43 @@ Describe 'install 配置种子' {
     }
   }
 }
+
+Describe '零窗口启动器（VBS）' {
+  It 'cscript 语法自检通过、能拉起目标、且单实例守卫生效' {
+    # 背景：wscript 是 GUI 宿主，VBS 语法错误只弹模态框（如误用保留字 Like 会报
+    # 800A03F2 缺少标识符），日志里什么都看不到 —— 必须由测试兜住。
+    $vbs = Join-Path $root 'lib\run-supervisor-hidden.vbs'
+    (Test-Path -LiteralPath $vbs) | Should Be $true
+    # wscript 对编码敏感：文件必须是纯 ASCII
+    @([System.IO.File]::ReadAllBytes($vbs) | Where-Object { $_ -gt 127 }).Count | Should Be 0
+
+    $dir = Join-Path $env:TEMP ('netenv-vbs-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $probePid = 0
+    try {
+      # 用桩替换 supervisor-loop.ps1：写 PID 后常驻，既能验证被拉起，又不会真起自愈循环
+      Set-Content -LiteralPath (Join-Path $dir 'supervisor-loop.ps1') -Encoding ascii -Value @(
+        '"$PID" | Set-Content -LiteralPath (Join-Path $PSScriptRoot ''marker.txt'')',
+        'Start-Sleep -Seconds 20'
+      )
+      Copy-Item -LiteralPath $vbs -Destination (Join-Path $dir 'launcher.vbs') -Force
+      $marker = Join-Path $dir 'marker.txt'
+
+      $out = & cscript.exe //nologo (Join-Path $dir 'launcher.vbs') 2>&1 | Out-String
+      $out.Trim() | Should Be ''
+      Start-Sleep -Seconds 3
+      (Test-Path -LiteralPath $marker) | Should Be $true
+      $first = (Read-NetEnvFileText $marker).Trim()
+      $first | Should Match '^\d+$'
+      $probePid = [int]$first
+
+      # 第二次运行必须被守卫拦下：marker 内容（即 PID）不得被刷新
+      $null = & cscript.exe //nologo (Join-Path $dir 'launcher.vbs') 2>&1
+      Start-Sleep -Seconds 2
+      (Read-NetEnvFileText $marker).Trim() | Should Be $first
+    } finally {
+      if ($probePid -gt 0) { Stop-Process -Id $probePid -Force -ErrorAction SilentlyContinue }
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}

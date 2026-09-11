@@ -131,6 +131,17 @@ function Invoke-NetEnvDoctor {
     }
   Add-Check 'bom' '脚本 UTF-8 BOM' ($noBom.Count -eq 0) $(if ($noBom.Count) { "缺 BOM: $($noBom -join ', ')" } else { '全部运行时脚本均带 BOM' })
 
+  # 零窗口启动器：计划任务全靠它。VBS 语法错误在 wscript 下只弹模态框（实测误用保留字
+  # Like 报 800A03F2 缺少标识符），日志里看不到任何痕迹 —— 所以体检至少要保证文件在且是
+  # 纯 ASCII（wscript 对编码敏感）；语法本身由 tests\netenv.tests.ps1 的 cscript 自检覆盖。
+  $vbsLauncher = Join-Path (Get-NetEnvRoot) 'lib\run-supervisor-hidden.vbs'
+  if (-not (Test-Path -LiteralPath $vbsLauncher)) {
+    Add-Check 'launcher' '零窗口启动器(VBS)' $false "缺失: $vbsLauncher（自启动任务会静默失败）"
+  } else {
+    $vbsNonAscii = @([System.IO.File]::ReadAllBytes($vbsLauncher) | Where-Object { $_ -gt 127 }).Count
+    Add-Check 'launcher' '零窗口启动器(VBS)' ($vbsNonAscii -eq 0) $(if ($vbsNonAscii -gt 0) { "含 $vbsNonAscii 个非 ASCII 字节（wscript 编码敏感，需改回 ASCII）" } else { '就绪（纯 ASCII，语法见 tests\netenv.tests.ps1）' })
+  }
+
   # geodata 完整性：mihomo 缺任一项会尝试联网自取，失败即整包配置加载失败
   $geoMissing = (New-Object System.Collections.Generic.List[string])
   foreach ($g in 'GeoSite.dat', 'geoip.metadb') {

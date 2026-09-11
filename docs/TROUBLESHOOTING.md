@@ -7,6 +7,7 @@
 - 局域网设备被 fake-ip 拦截：私网段（10/172.16/192.168）默认直连例外。
 - MCP 无输出：检查是否以 stdio 启动；日志在 stderr。
 - 便携版换盘符：配置全相对路径，启动自检；若自启动任务失效，重跑 `install --autostart`。
+- 自启动没反应且桌面弹出 `Microsoft VBScript 编译器错误`：见下方「VBS 启动器语法错误」。
 
 ## 常见故障（实测记录）
 
@@ -49,6 +50,13 @@
   现已容错（空/损坏锁文件自动回收），且锁改为原子写，不会再产生半截文件。
 - **`install` 首次安装即失败（配置不存在）**：`robocopy` 排除了 `config`，安装后又去读 `%LOCALAPPDATA%\NetEnv\config\netenv.json`。
   现在首次安装会补种 `netenv.json`/`sources.json`/`clients.json`，重复安装不覆盖本机改动。
+- **开机/定时任务没反应，桌面弹出 `Microsoft VBScript 编译器错误`（例：`行: 12 字符: 48 800A03F2 缺少标识符`）**：
+  `lib\run-supervisor-hidden.vbs` 有语法或编码问题。`wscript.exe` 是 GUI 宿主，**错误只弹模态框，日志里没有任何痕迹**，
+  所以表现为「自愈循环再也没起来」而不是报错。
+  - 诊断：`cscript //nologo lib\run-supervisor-hidden.vbs` —— cscript 会把编译错误打到控制台（本次实测就靠它定位）。
+  - 已踩过的坑：**VBScript 保留字不能当变量名**（`Like` 是运算符，`Dim ... like` 直接编译失败）；该文件必须保持**纯 ASCII**。
+  - 兜底：`doctor` 有「零窗口启动器(VBS)」项检查存在性与 ASCII；`tests\netenv.tests.ps1` 用 cscript 做语法自检，
+    并验证「能拉起目标」与「单实例守卫生效」。
 - **`MethodNotFound: SHA256 不包含 HashData`**：`SHA256::HashData` / `Convert::ToHexString` / `MD5::HashData`
   都是 .NET 5+ API，Windows PowerShell 5.1 的 .NET Framework 下不存在。需改用
   `New-Object System.Security.Cryptography.SHA256Managed` + `ComputeHash` + 逐字节 `ToString('x2')`。
