@@ -291,16 +291,18 @@ function Test-NetEnvEgress {
   # （实测同一节点 curl -k 能拿到 401，而默认校验报 SEC_E_CERT_EXPIRED），
   # 而 mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康。
   if ($VerifyCert) {
-    $out = & curl.exe -sS -o NUL -w '%{http_code}' -x ("http://127.0.0.1:$ProxyPort") --connect-timeout $TimeoutSec --max-time ($TimeoutSec * 3) $ProbeUrl 2>&1
-    $sw.Stop()
+    # 用 --silent --show-error 会在失败时把 curl 的 stderr 直接喷到控制台（污染 doctor 输出），
+    # 因此这里完全静默，只取 http_code；失败原因由 Exit 状态与空 code 推断。
+    $out = & curl.exe -s -o NUL -w '%{http_code}' -x ("http://127.0.0.1:$ProxyPort") --connect-timeout $TimeoutSec --max-time ($TimeoutSec * 3) $ProbeUrl 2>$null
     $code = ($out -join '')
     $ok = ($code -match '^\d{3}$')
+    $sw.Stop()
     return [PSCustomObject]@{
       Ok    = $ok
       Status = if ($ok) { [int]$code } else { 0 }
       Ms    = $sw.ElapsedMilliseconds
       Url   = $ProbeUrl
-      Error = if ($ok) { $null } else { $code }
+      Error = if ($ok) { $null } else { if ($code) { $code } else { 'TLS/证书校验失败（节点可能呈现过期或伪造证书）' } }
     }
   }
 
