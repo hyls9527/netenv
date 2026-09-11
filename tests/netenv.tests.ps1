@@ -172,4 +172,180 @@ proxies:
       Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
     }
   }
+
+  It '节点被全部过滤时返回空串（调用方据此保住旧 merged.yaml，不写空配置断网）' {
+    $subDir = Join-Path $env:TEMP ('netenv-subempty-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      Set-Content -LiteralPath (Join-Path $subDir 'x.yaml') -Value @'
+proxies:
+  - name: "https://example.com/官网"
+    type: vmess
+    server: 1.1.1.1
+rules:
+  - MATCH,auto
+'@ -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      (Build-NetEnvMergedConfig $subDir $cfg) | Should Be ''
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Describe '配置读取与编码' {
+  It '无 BOM 的 UTF-8 文件也能读出中文（PS 5.1 Get-Content 会按 GBK 解码成乱码）' {
+    $dir = Join-Path $env:TEMP ('netenv-enc-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+      $f = Join-Path $dir 'cfg.json'
+      [System.IO.File]::WriteAllText($f, '{"name":"语音ChatGPT-开机启动.lnk"}', (New-Object System.Text.UTF8Encoding($false)))
+      ([System.IO.File]::ReadAllBytes($f)[0] -eq 0xEF) | Should Be $false
+      $txt = Read-NetEnvFileText $f
+      $txt | Should Match '语音ChatGPT'
+      ($txt | ConvertFrom-Json).name | Should Be '语音ChatGPT-开机启动.lnk'
+    } finally {
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '配置损坏时 -Quiet 返回 $null 而不是抛错（否则连日志都写不出去）' {
+    $saved = $script:NetEnvRoot
+    $dir = Join-Path $env:TEMP ('netenv-badcfg-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    try {
+      Set-Content -LiteralPath (Join-Path $dir 'config\netenv.json') -Value '{ "ports": ' -Encoding utf8
+      $script:NetEnvRoot = $dir
+      (Read-NetEnvConfig -Quiet) | Should BeNullOrEmpty
+      { Read-NetEnvConfig } | Should Throw
+    } finally {
+      $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It 'Save-NetEnvTextFile 原子落盘：内容正确、无 BOM、不留临时文件' {
+    $dir = Join-Path $env:TEMP ('netenv-atomic-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+      $f = Join-Path $dir 'state.json'
+      Save-NetEnvTextFile -Path $f -Content '{"节点":1}'
+      (Read-NetEnvFileText $f) | Should Be '{"节点":1}'
+      ([System.IO.File]::ReadAllBytes($f)[0] -eq 0xEF) | Should Be $false
+      @(Get-ChildItem -LiteralPath $dir -Filter '*.tmp-*').Count | Should Be 0
+      # 覆盖写也必须成功
+      Save-NetEnvTextFile -Path $f -Content '{"节点":2}'
+      (Read-NetEnvFileText $f) | Should Be '{"节点":2}'
+    } finally {
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Describe '端口派生' {
+  It '代理 URL 只从端口表派生，改 netenv.json 不会与 mihomo 实际端口漂移' {
+    (Get-NetEnvProxyUrl (Read-NetEnvConfig)) | Should Be 'http://127.0.0.1:7897'
+    $fake = [PSCustomObject]@{ ports = [PSCustomObject]@{ mihomoHttp = 18123 } }
+    (Get-NetEnvProxyUrl $fake) | Should Be 'http://127.0.0.1:18123'
+  }
+}
+
+Describe '实例锁' {
+  It '0 字节锁文件不得让命令崩溃，且应被回收' {
+    $lock = Join-Path (Get-NetEnvPaths).Data 'netenv.lock'
+    if (Test-Path -LiteralPath $lock) { Remove-Item -LiteralPath $lock -Force }
+    New-Item -ItemType File -Path $lock -Force | Out-Null
+    try {
+      $got = Enter-NetEnvLock
+      $got | Should Be $lock
+      (Read-NetEnvFileText $got).Trim() | Should Be "$PID"
+    } finally {
+      Exit-NetEnvLock $lock
+    }
+  }
+}
+
+Describe '证书校验探针' {
+  It '连接失败（curl http_code=000）不得判为"证书有效"' {
+    $r = Test-NetEnvEgress -ProbeUrl 'https://github.com/robots.txt' -TimeoutSec 3 -ProxyPort 1 -VerifyCert
+    $r.Ok | Should Be $false
+    $r.Status | Should Be 0
+    $r.Error | Should Not BeNullOrEmpty
+  }
+}
+
+Describe 'doctor JSON 输出' {
+  It '--json 必须是合法 JSON 且含 ok/fails/checks（PS 5.1 下 @($List[object]) 会抛 types do not match）' {
+    . "$root\lib\doctor.ps1"
+    # 只验证 JSON 序列化路径：桩掉网络探针与最慢的三个系统查询
+    # （Get-ScheduledTask / Get-CimInstance / Get-NetTCPConnection 在 5.1 下各要 1-3s，
+    #   真跑会把本用例拖到 ~30s，且网络探针结果不稳定）
+    function Test-NetEnvEgress { param([string]$ProbeUrl, [int]$TimeoutSec, [int]$ProxyPort, [switch]$VerifyCert)
+      [PSCustomObject]@{ Ok = $true; Status = 204; Ms = 1; Url = $ProbeUrl; Error = $null } }
+    function Get-ScheduledTask { [CmdletBinding()] param() }
+    function Get-CimInstance { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    function Get-NetTCPConnection { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    $raw = Invoke-NetEnvDoctor -Json -NoExit
+    $obj = $raw | ConvertFrom-Json
+    ($obj.PSObject.Properties.Name -contains 'ok') | Should Be $true
+    ($obj.PSObject.Properties.Name -contains 'fails') | Should Be $true
+    @($obj.checks).Count | Should BeGreaterThan 0
+    @($obj.checks | Where-Object { $_.id -eq 'egress' }).Count | Should Be 1
+    # fail 计数必须与 checks 里 ok=false 的条数一致（防统计与实际状态漂移）
+    @($obj.checks | Where-Object { -not $_.ok }).Count | Should Be ([int]$obj.fails)
+  }
+}
+
+Describe '订阅刷新（离线，不触网）' {
+  It '无可用源时不写 merged.yaml，sub-state.json 仍合法可解析' {
+    $saved = $script:NetEnvRoot
+    $dir = Join-Path $env:TEMP ('netenv-refresh-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      '[{"id":"test-no-such-source","name":"x","trusted":true},{"id":"test-disabled","name":"y","disabled":true}]' |
+        Set-Content -LiteralPath (Join-Path $dir 'config\sources.json') -Encoding utf8
+      # 预置 geodata（>1MB 视为就绪），避免刷新流程真的去下载
+      foreach ($g in 'GeoSite.dat', 'geoip.metadb') {
+        [System.IO.File]::WriteAllBytes((Join-Path $dir ("data\" + $g)), (New-Object byte[] 1000001))
+      }
+      $script:NetEnvRoot = $dir
+      $st = Invoke-NetEnvNodesRefresh
+      (Test-Path -LiteralPath (Join-Path $dir 'data\merged.yaml')) | Should Be $false
+      [int]$st.nodeCount | Should Be 0
+      $st.sourceStatus['test-disabled'] | Should Be '已停用'
+      $st.sourceStatus['test-no-such-source'] | Should Match '未配置'
+      $parsed = (Read-NetEnvFileText (Join-Path $dir 'data\sub-state.json')) | ConvertFrom-Json
+      $parsed.sourceStatus.'test-disabled' | Should Be '已停用'
+    } finally {
+      $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Describe 'install 配置种子' {
+  It '首次安装必须种入 config/*.json，重复安装不得覆盖本机配置' {
+    . "$root\lib\setup.ps1"
+    $savedLocal = $env:LOCALAPPDATA
+    $dir = Join-Path $env:TEMP ('netenv-install-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+      $env:LOCALAPPDATA = $dir
+      Invoke-NetEnvInstall | Out-Null
+      $installed = Join-Path $dir 'NetEnv'
+      (Test-Path -LiteralPath (Join-Path $installed 'config\netenv.json')) | Should Be $true
+      (Test-Path -LiteralPath (Join-Path $installed 'config\sources.json')) | Should Be $true
+      (Test-Path -LiteralPath (Join-Path $installed 'config\clients.json')) | Should Be $true
+      ((Read-NetEnvFileText (Join-Path $installed 'config\netenv.json')) | ConvertFrom-Json).mode | Should Be 'installed'
+      # 本机改过的配置在重复安装时必须保留
+      Save-NetEnvTextFile -Path (Join-Path $installed 'config\netenv.json') -Content '{"mode":"installed","ports":{"mihomoMixed":1,"mihomoHttp":2,"mihomoController":3},"marker":"keep-me"}'
+      Invoke-NetEnvInstall | Out-Null
+      ((Read-NetEnvFileText (Join-Path $installed 'config\netenv.json')) | ConvertFrom-Json).marker | Should Be 'keep-me'
+    } finally {
+      $env:LOCALAPPDATA = $savedLocal
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
 }

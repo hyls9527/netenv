@@ -27,7 +27,7 @@
 ```text
 netenv.ps1          主入口（调度器 + 实例锁）
 netenv-mcp.ps1      MCP stdio server（JSON-RPC 2.0，默认只读）
-lib/                core.ps1 + 12 个命令模块 + 1 个零窗口启动器（run-supervisor-hidden.vbs）
+lib/                core.ps1 + 命令模块 + supervisor/supervisor-loop（常驻自愈）+ run-supervisor-hidden.vbs（零窗口启动器）
 config/             netenv.json / sources.json / clients.json（默认值，不含密钥）
 docs/               文档（见下方索引）
 tests/              Pester 测试与回归脚本
@@ -57,10 +57,25 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   端口在听 ≠ 能上网 —— 实测 423 个节点中仅 8 个能到 google，而端口照样 LISTEN。
 - **降级链**：探针连续失败达 `health.failThreshold` → 触发 `nodes refresh`（自带失败保留旧配置）
   → 仍不可用且 `health.autoFallbackToDirect` 为真时回退 `apply -profile direct`。状态写入 `data/health-state.json`。
-- 计划任务 `NetEnv-Supervisor`（开机）+ `NetEnv-Supervisor-Periodic`（定时）→ `lib\run-supervisor-hidden.vbs` → `lib\supervisor-loop.ps1`：探活并拉起 mihomo / new-api
-- 日志按天轮转、脱敏，保留 30 天（`logs/`，不入库）
+- 计划任务 `NetEnv-Supervisor`（开机）+ `NetEnv-Supervisor-Periodic`（每 5 分钟）→ `lib\run-supervisor-hidden.vbs` → `lib\supervisor-loop.ps1`：探活并拉起 mihomo / new-api
+  - `install --autostart` 需要管理员权限；**两条任务都用 `wscript.exe` 启动 VBS，不依赖 PATH 里的 `pwsh.exe`**（PATH 缺 pwsh 时计划任务会静默失败），且不闪黑窗
+  - VBS 内有**单实例守卫**：周期任务只在自愈循环已死时补拉，不会出现两个循环抢重启与日志
+- **失败统计只认"已部署"的服务**：二进制不存在的可选服务（new-api/Sub-Store）直接跳过，
+  不参与失败计数（否则未部署的 new-api 会让日志每分钟刷一条 ERROR，把真故障淹没）
+- 日志按天轮转、脱敏、UTF-8 编码，保留天数由 `logging.rotateDays`（默认 14）决定，`netenv clean` 用同一口径（`logs/`，不入库）
 - **订阅刷新不是自动的**：需手动 `nodes refresh`（或用你自己的调度；`merged.yaml` 的生成时间可在 `data/sub-state.json` 查看）
 - 非管理员可用的只读动作：`doctor` / `status`；`adopt -Apply` 等接管动作需要管理员权限
+
+## 维护与自检
+
+- 回归：`Import-Module Pester; .\tests\regression.ps1`（Pester 3.4，跑 3 轮）；`.\tests\regression.ps1 -Live` 会真起 mihomo 并临时切系统代理，仅在需要冒烟时用
+- 体检：`netenv doctor`（失败项退出码 1）；`doctor --json` 提供给 MCP 的 `netenv_doctor_summary`
+- **改完任何 `.ps1` 必须复查 UTF-8 BOM**：编辑工具常常顺手剥掉 BOM，5.1 会按 GBK 解码使中文破坏引号配对（`doctor` 有 `脚本 UTF-8 BOM` 项兜底）
+- Windows PowerShell 5.1 实测坑位（改代码前先看，避免重新踩）：
+  - `@($genericListOfObject)` 会抛 `Argument types do not match`（`List[string]`/`Object[]` 正常）→ 统一用 `.ToArray()`
+  - `Get-Content -Raw` 默认按 ANSI(GBK) 解码 → 读配置/状态一律走 `Read-NetEnvFileText`（显式 UTF-8，兼容有/无 BOM）
+  - `curl` 连接失败时 `%{http_code}` 返回 `000`，"3 位数字"不等于成功 → 必须结合退出码判断
+  - 外部命令缺失（`npm`/`gh`/`7z`）在 `$ErrorActionPreference='Stop'` 下会终止整条流程 → 先 `Get-Command` 守卫再降级
 
 ## 文档索引
 

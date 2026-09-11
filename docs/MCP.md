@@ -17,4 +17,8 @@ command = "pwsh"
 args = ["-NoProfile", "-File", "C:\\path\\to\\netenv\\netenv-mcp.ps1"]
 ```
 
+- 没有 `pwsh`（或它不在 PATH）的机器改用完整路径的 Windows PowerShell：
+  `command = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"`（脚本本身兼容 5.1）。
+- `netenv_doctor_summary` 走完整体检（含真实出品与证书探针），冷启动可能十几秒到几十秒；客户端读取超时请放宽。
+
 写操作默认禁用；`netenv.json` 中 `mcp.allowWrite` 显式改为 true 才开启。

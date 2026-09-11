@@ -12,14 +12,28 @@ function Get-NetEnvStatus {
   $sub = $null
   $subState = Join-Path $paths.Data 'sub-state.json'
   if (Test-Path -LiteralPath $subState) {
-    $sub = Get-Content -LiteralPath $subState -Raw | ConvertFrom-Json
+    try { $sub = (Read-NetEnvFileText $subState) | ConvertFrom-Json } catch { Write-NetEnvLog 'WARN' "status: sub-state.json 不可解析" }
   }
 
   # 出品健康：由 supervisor-loop 的端到端探针写入（端口在听 ≠ 能上网）
   $health = $null
   $healthFile = Join-Path $paths.Data 'health-state.json'
   if (Test-Path -LiteralPath $healthFile) {
-    try { $health = Get-Content -LiteralPath $healthFile -Raw | ConvertFrom-Json } catch { }
+    try { $health = (Read-NetEnvFileText $healthFile) | ConvertFrom-Json } catch { }
+  }
+  # 探针数据过期（supervisor-loop 已死/未启动）时不能继续报"健康"：旧的成功记录会掩盖真故障
+  $egressOk = $null
+  $egressFresh = $false
+  if ($health -and $health.probedAt) {
+    $maxAgeMin = 30
+    if ($cfg.health -and $cfg.health.probeIntervalMinutes) { $maxAgeMin = [int]$cfg.health.probeIntervalMinutes * 3 }
+    if ($maxAgeMin -lt 15) { $maxAgeMin = 15 }
+    try {
+      if (((Get-Date) - [datetime]$health.probedAt).TotalMinutes -le $maxAgeMin) {
+        $egressFresh = $true
+        $egressOk = ([int]$health.consecutiveFail -eq 0)
+      }
+    } catch { }
   }
 
   $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
@@ -41,7 +55,8 @@ function Get-NetEnvStatus {
     subscriptionUpdatedAt = if ($sub) { $sub.updatedAt } else { $null }
     subscriptionHoursAgo = if ($sub) { [math]::Round(((Get-Date) - [datetime]$sub.updatedAt).TotalHours, 1) } else { $null }
     nodeCount = if ($sub) { $sub.nodeCount } else { 0 }
-    egressOk = if ($health) { ([int]$health.consecutiveFail -eq 0) } else { $null }
+    egressOk = $egressOk
+    egressFresh = $egressFresh
     egressCheckedAt = if ($health) { $health.probedAt } else { $null }
     egressLastOk = if ($health) { $health.lastOk } else { $null }
     egressLastMs = if ($health) { $health.lastOkMs } else { $null }

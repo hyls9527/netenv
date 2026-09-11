@@ -16,7 +16,9 @@
   **任何编辑工具都可能顺手剥掉 BOM，改完必查。**
 - **`The term 'npm' is not recognized` 导致 `apply`/`doctor` 整体中断**：
   在 `$ErrorActionPreference='Stop'` 下调用不存在的命令会终止流程。已对 `npm` 加 `Get-Command` 守卫（缺失则跳过并 WARN）。
-- **`pwsh` 不存在**：全部脚本兼容 5.1；但 `install --autostart` 生成的计划任务写的是 `pwsh.exe`，此类机器请改用便携模式 + 启动文件夹。
+- **`pwsh` 不存在**：全部脚本兼容 5.1；`install --autostart` 已改为 `wscript.exe` + `lib\run-supervisor-hidden.vbs`
+  （零窗口、不依赖 PATH 里的 `pwsh.exe`，PATH 缺 pwsh 时 `-Execute 'pwsh.exe'` 的计划任务会静默失败）。
+  仍无管理员权限的机器用便携模式 + 启动文件夹快捷方式。
 - **`github.com` 打不开，但 `api.github.com` / `codeload.github.com` 正常**：
   典型 DNS 污染 —— `github.com` 被解析到不可达 IP（实测 `20.205.243.166` 超时，真实 IP `140.82.112.3` 可通）。
   诊断：`Resolve-DnsName github.com -Type A -Server 223.5.5.5`，再对解析出的 IP 做 TCP 443 探测。
@@ -25,11 +27,28 @@
 - **mihomo 启动即失败并报 `can't download GeoSite.dat`**：
   它会在启动时去墙外下载 geodata。需预置 `data\GeoSite.dat` 与 `data\geoip.metadb`（放在 `-d` 指向的数据根，**不是** `data\bin\`）。
 - **规则重复**：同一域名同时命中 `DIRECT` 与 `github-adaptive` 说明该域被同时写进 `sensitiveDomains`/`githubAuthDomains` 与 `githubAdaptiveDomains`。前者优先，后者永远不可达，需从 `githubAdaptiveDomains` 移除。
-- **`tests\netenv.tests.ps1` 在 Pester 3.4.0 下失败**（已实测，非版本兼容问题）：
+- **`tests\netenv.tests.ps1` 在 Pester 3.4.0 下失败**（历史记录，已修复）：
   1. `Describe 'NetEnv config'` 报 `PSInvalidCastException` —— Pester 3 的 `Describe` 第二参数必须是 ScriptBlock，测试却传了字符串；
   2. `$out | Should Match 'name: auto-select'` 断言组名 `auto-select`，但 `Build-NetEnvMergedConfig` 生成的是 `auto-urltest`。
-  两者都是**测试与实现的历史漂移**（测试按 Pester 5 语法编写），需更新测试而非改配置。运行时功能不受影响。
+  两者都是**测试与实现的历史漂移**，已按实现修正断言；当前 20 个用例全绿（`.\tests\regression.ps1`）。
 - 测试文件中的 `ghp_...` 字面量是**脱敏用例的样本值**，不是真实凭据，无需处理。
+- **`doctor --json` 或 MCP `netenv_doctor_summary` 报 `Argument types do not match`**：
+  Windows PowerShell 5.1 下 `@($genericListOfObject)` 会抛 `ArgumentException`（`List[string]`、`Object[]` 均正常，实测 5.1.26100）。
+  已改为 `.ToArray()`；`secrets archive` 写 manifest 时有同一处坑，一并修复。**新增 List→JSON 的代码请照此写法。**
+- **`出口证书可信（非 MITM）`显示 `HTTP 0 in 29486ms（证书有效）`**：假阳性。
+  `curl` 连接/TLS 失败时 `%{http_code}` 是 `000`，也满足"3 位数字"判断，于是把 schannel 握手失败（exit 35）误判成证书有效。
+  已改为「退出码为 0 且状态码 > 0」才算通过，并把失败原因（含 curl 退出码）写进 detail。现在同一情形会如实报失败。
+- **`supervisor` 每分钟一条 `连续 N 轮失败（newApi）`**：误报。可选服务（new-api / Sub-Store）未部署也被计入失败。
+  现在判据是"**二进制存在才算已部署**"：未部署则静默跳过、不计失败；已部署但没起来才计入并尝试拉起。
+- **`nodes refresh` 后节点全没了 / mihomo 起不来**：曾出现"源里有 `proxies:` 但一个可用节点都没产出"时把空配置写进 `merged.yaml`。
+  现已加保护：**生成的节点列表为空则保留旧 `merged.yaml`** 并在 `data\sub-state.json` 记 `mergedEmpty: true`。
+- **配置里的中文变乱码（`语音ChatGPT-开机启动.lnk` 读成 `璇煶ChatGPT-...`）**：
+  `config\netenv.json` 无 BOM，而 5.1 的 `Get-Content` 默认按 ANSI(GBK) 解码。
+  已统一改用 `Read-NetEnvFileText`（显式 UTF-8，兼容有/无 BOM），启动项检查随之恢复有效。
+- **所有命令都报 `不能对 Null 值表达式调用方法`**：`data\netenv.lock` 被写成了 0 字节（进程在写入前被杀）。
+  现已容错（空/损坏锁文件自动回收），且锁改为原子写，不会再产生半截文件。
+- **`install` 首次安装即失败（配置不存在）**：`robocopy` 排除了 `config`，安装后又去读 `%LOCALAPPDATA%\NetEnv\config\netenv.json`。
+  现在首次安装会补种 `netenv.json`/`sources.json`/`clients.json`，重复安装不覆盖本机改动。
 - **`MethodNotFound: SHA256 不包含 HashData`**：`SHA256::HashData` / `Convert::ToHexString` / `MD5::HashData`
   都是 .NET 5+ API，Windows PowerShell 5.1 的 .NET Framework 下不存在。需改用
   `New-Object System.Security.Cryptography.SHA256Managed` + `ComputeHash` + 逐字节 `ToString('x2')`。

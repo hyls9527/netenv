@@ -31,7 +31,8 @@ function Invoke-NetEnvDoctor {
 
   # 系统代理（仅 WinINET；WinHTTP 只记录）
   $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
-  $proxyOk = -not $ie.ProxyEnable -or ($ie.ProxyServer -like '*127.0.0.1:7897*')
+  $proxyHostPort = (Get-NetEnvProxyUrl $cfg) -replace '^https?://', ''
+  $proxyOk = -not $ie.ProxyEnable -or ($ie.ProxyServer -like "*$proxyHostPort*")
   Add-Check 'sysproxy' '系统代理(WinINET)' $proxyOk "ProxyEnable=$($ie.ProxyEnable); ProxyServer=$($ie.ProxyServer)"
   $winhttp = (netsh winhttp show proxy 2>$null | Select-String 'Direct access' | Measure-Object).Count
   Add-Check 'winhttp' 'WinHTTP(仅记录)' $true ("状态: $(if ($winhttp -gt 0) {'直连'} else {'非直连'})")
@@ -46,7 +47,7 @@ function Invoke-NetEnvDoctor {
 
   # git / npm
   $gitProxy = git config --global --get http.proxy 2>$null
-  Add-Check 'gitproxy' 'git 全局代理' ($null -eq $gitProxy -or $gitProxy -match '127.0.0.1:7897') ("http.proxy=$(ConvertTo-Redacted $gitProxy)")
+  Add-Check 'gitproxy' 'git 全局代理' ($null -eq $gitProxy -or $gitProxy -match [regex]::Escape($proxyHostPort)) ("http.proxy=$(ConvertTo-Redacted $gitProxy)")
   if (Get-Command npm -ErrorAction SilentlyContinue) {
     $npmProxy = npm config get proxy 2>$null
     $npmHttps = npm config get https-proxy 2>$null
@@ -97,22 +98,27 @@ function Invoke-NetEnvDoctor {
     }
   }
 
-  # 订阅新鲜度
+  # 订阅新鲜度（状态文件可能被半截写入，解析失败要报出来而不是让 doctor 崩掉）
   $paths = Get-NetEnvPaths
   $subState = Join-Path $paths.Data 'sub-state.json'
   if (Test-Path -LiteralPath $subState) {
-    $st = Get-Content -LiteralPath $subState -Raw | ConvertFrom-Json
-    $age = ((Get-Date) - [datetime]$st.updatedAt).TotalHours
-    Add-Check 'subfresh' '订阅新鲜度' ($age -lt 26) "上次更新 $([math]::Round($age,1)) 小时前（告警阈值 26h）"
+    try {
+      $st = (Read-NetEnvFileText $subState) | ConvertFrom-Json
+      $age = ((Get-Date) - [datetime]$st.updatedAt).TotalHours
+      Add-Check 'subfresh' '订阅新鲜度' ($age -lt 26) "上次更新 $([math]::Round($age,1)) 小时前（告警阈值 26h）"
+    } catch {
+      Add-Check 'subfresh' '订阅新鲜度' $false "sub-state.json 不可解析: $($_.Exception.Message)"
+    }
   } else {
     Add-Check 'subfresh' '订阅新鲜度' $false '尚未执行 nodes refresh'
   }
 
-  # 配置校验（schema + 备份存在性）
+  # 配置校验（schema；备份只是可回滚能力，缺备份不代表系统不健康 —— 便携版首次 apply 前必然是 0 份）
   $cfgOk = $true
   try { $null = Read-NetEnvConfig } catch { $cfgOk = $false }
   $backupCount = (Get-ChildItem -LiteralPath (Get-NetEnvPaths).Backups -Filter 'config-*' -ErrorAction SilentlyContinue | Measure-Object).Count
-  Add-Check 'config' '配置校验与备份' ($cfgOk -and $backupCount -gt 0) "配置有效；备份 $backupCount 份"
+  $backupNote = if ($backupCount -gt 0) { "备份 $backupCount 份" } else { '尚无配置备份（apply / config edit 会自动生成）' }
+  Add-Check 'config' '配置校验与备份' $cfgOk "配置有效；$backupNote"
 
   # .ps1 必须带 UTF-8 BOM：无 BOM 时 Windows PowerShell 5.1 按 ANSI/GBK 解码，
   # 中文注释会破坏引号配对并导致 ParseException（实测高频故障）
@@ -139,15 +145,19 @@ function Invoke-NetEnvDoctor {
     $eg = Test-NetEnvEgress -TimeoutSec 10
     Add-Check 'egress' '端到端出品（经代理实测）' $eg.Ok $(if ($eg.Ok) { "HTTP $($eg.Status) in $($eg.Ms)ms" } else { "不可用: $($eg.Error)" })
     # 证书校验：mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康
-    $cert = Test-NetEnvEgress -ProbeUrl 'https://github.com/robots.txt' -TimeoutSec 10 -VerifyCert
-    Add-Check 'certverify' '出口证书可信（非 MITM）' $cert.Ok $(if ($cert.Ok) { "HTTP $($cert.Status) in $($cert.Ms)ms（证书有效）" } else { "证书校验失败（节点可能呈现伪造/过期证书）: $($cert.Error)" })
+    $certUrl = if ($cfg.subscription.githubUrlTest.url) { $cfg.subscription.githubUrlTest.url } else { 'https://github.com/robots.txt' }
+    $cert = Test-NetEnvEgress -ProbeUrl $certUrl -TimeoutSec 10 -VerifyCert
+    Add-Check 'certverify' '出口证书可信（非 MITM）' $cert.Ok $(if ($cert.Ok) { "HTTP $($cert.Status) in $($cert.Ms)ms（证书有效）" } else { "证书校验失败: $($cert.Error)（换节点或走 DIRECT；见 docs/TROUBLESHOOTING.md）" })
   } else {
     Add-Check 'egress' '端到端出品（经代理实测）' $true 'mihomo 未监听，跳过'
     Add-Check 'certverify' '出口证书可信（非 MITM）' $true 'mihomo 未监听，跳过'
   }
 
   if ($Json) {
-    return [PSCustomObject]@{ ok = ($script:fails -eq 0); fails = $script:fails; checks = @($checks) } | ConvertTo-Json -Depth 5
+    # 必须用 ToArray()：Windows PowerShell 5.1 上 @($List[object]) 会抛
+    # "Argument types do not match"（本机 5.1.26100 实测，List[string]/Object[] 正常），
+    # 之前用 @($checks) 导致 doctor --json 与 MCP 的 netenv_doctor_summary 直接报错。
+    return [PSCustomObject]@{ ok = ($script:fails -eq 0); fails = $script:fails; checks = $checks.ToArray() } | ConvertTo-Json -Depth 5
   }
 
   foreach ($c in $checks) {

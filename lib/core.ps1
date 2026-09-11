@@ -2,6 +2,38 @@
 
 function Get-NetEnvRoot { return $script:NetEnvRoot }
 
+# 显式 UTF-8 读取：Windows PowerShell 5.1 的 Get-Content 默认按 ANSI(GBK) 解码，
+# 无 BOM 的 UTF-8 文件里的中文会变成乱码（实测 config\netenv.json 无 BOM，
+# startupItems[0] 被读成 "璇煶ChatGPT-..."，导致启动项检查静默失效）。
+# File.ReadAllText 默认检测并剥离 BOM，带/不带 BOM 的 UTF-8 都能正确解码。
+function Read-NetEnvFileText {
+  param([Parameter(Mandatory)][string]$Path)
+  return [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+# 原子写：先写同目录临时文件再替换，避免进程被杀/断电时留下半截文件
+# （配置/状态文件被读坏会让 status、doctor 这些排障入口一起失效）。
+function Save-NetEnvTextFile {
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+  )
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+  $tmp = "$Path.tmp-$PID"
+  [System.IO.File]::WriteAllText($tmp, $Content, (New-Object System.Text.UTF8Encoding($false)))
+  Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
+# 代理入口 URL 只从端口表派生：写死 7897 会在改 config\netenv.json 后与 mihomo 实际端口漂移
+function Get-NetEnvProxyUrl {
+  param($Cfg)
+  if (-not $Cfg) { $Cfg = Read-NetEnvConfig -Quiet }
+  $port = 7897
+  if ($Cfg -and $Cfg.ports -and $Cfg.ports.mihomoHttp) { $port = [int]$Cfg.ports.mihomoHttp }
+  return "http://127.0.0.1:$port"
+}
+
 function Get-NetEnvPaths {
   $cfg = Read-NetEnvConfig -Quiet
   if ($cfg.mode -eq 'installed') {
@@ -36,8 +68,11 @@ function Read-NetEnvConfig {
     throw "配置不存在: $cfgPath"
   }
   try {
-    $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+    $cfg = (Read-NetEnvFileText $cfgPath) | ConvertFrom-Json
   } catch {
+    # -Quiet 也必须吞掉解析错误：Write-NetEnvLog 会经 Get-NetEnvPaths 读取配置，
+    # 若这里抛错，配置一坏连日志都写不出去（原注释的"配置损坏不得打断主流程"意图落空）。
+    if ($Quiet) { return $null }
     throw "netenv.json 解析失败(配置校验失败): $($_.Exception.Message)"
   }
   # schema 校验
@@ -51,7 +86,7 @@ function Read-NetEnvJson {
   param([Parameter(Mandatory)][string]$Name)
   $path = Join-Path (Get-NetEnvRoot) "config\$Name.json"
   if (-not (Test-Path -LiteralPath $path)) { return @() }
-  try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { throw "$Name 解析失败: $($_.Exception.Message)" }
+  try { return ((Read-NetEnvFileText $path) | ConvertFrom-Json) } catch { throw "$Name 解析失败: $($_.Exception.Message)" }
 }
 
 function ConvertTo-Redacted {
@@ -80,7 +115,8 @@ function Write-NetEnvLog {
   if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
   $logFile = Join-Path $logDir "$(Get-Date -Format 'yyyyMMdd').log"
   $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, (ConvertTo-Redacted $Message)
-  Add-Content -LiteralPath $logFile -Value $line
+  # 显式 UTF8：不加时 PS 5.1 按 ANSI(GBK) 追加，中文日志会写成混合编码
+  Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8
   # 配置缺失/损坏时不得抛错（否则日志本身会打断主流程）；rotateDays 缺省 14
   $rotateDays = 14
   try {
@@ -116,15 +152,20 @@ function Get-PortOwner {
 function Enter-NetEnvLock {
   $lock = Join-Path (Get-NetEnvPaths).Data 'netenv.lock'
   if (Test-Path -LiteralPath $lock) {
-    $owner = (Get-Content -LiteralPath $lock -Raw).Trim()
+    # 锁文件可能是 0 字节（进程在写入前被杀）：Get-Content -Raw 对空文件返回 $null，
+    # 直接 .Trim() 会抛"不能对 Null 值表达式调用方法"，让所有命令都无法启动。
+    $owner = ''
+    try { $owner = (Read-NetEnvFileText $lock).Trim() } catch { $owner = '' }
     if ($owner -match '^\d+$' -and (Get-Process -Id ([int]$owner) -ErrorAction SilentlyContinue)) {
       throw "实例锁已存在(另一 NetEnv 实例运行中, PID $owner)。为避免端口冲突，本次操作中止。"
     }
+    Write-NetEnvLog 'WARN' "发现失效的实例锁（内容: '$owner'），已清理"
     Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
   }
   $dir = Split-Path $lock -Parent
   if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-  Set-Content -LiteralPath $lock -Value $PID
+  # 原子写：Set-Content 会先截断再写，被中断就留下 0 字节锁文件（正是上一个分支要处理的烂摊子）
+  Save-NetEnvTextFile -Path $lock -Content "$PID"
   return $lock
 }
 
@@ -154,14 +195,14 @@ function Save-NetEnvSnapshot {
     $snap.env[$n] = [Environment]::GetEnvironmentVariable($n, 'User')
   }
   $file = Join-Path $snapDir ("snap-{0}-{1}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), ($Label -replace '[^\w-]','_'))
-  $snap | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $file -Encoding utf8
+  Save-NetEnvTextFile -Path $file -Content ($snap | ConvertTo-Json -Depth 4)
   return $file
 }
 
 function Get-NetEnvSnapshot {
   param([Parameter(Mandatory)][string]$File)
   if (-not (Test-Path -LiteralPath $File)) { throw "快照不存在: $File" }
-  return (Get-Content -LiteralPath $File -Raw | ConvertFrom-Json)
+  return ((Read-NetEnvFileText $File) | ConvertFrom-Json)
 }
 
 # 解析 7z 可执行文件（不写死安装路径；缺失时返回 $null）。
@@ -260,7 +301,7 @@ function Get-NetEnvCredentialValue {
   if ($v) { return $v }
   $local = Join-Path (Get-NetEnvRoot) 'config\local.credentials.json'
   if (Test-Path -LiteralPath $local) {
-    $map = Get-Content -LiteralPath $local -Raw | ConvertFrom-Json
+    $map = (Read-NetEnvFileText $local) | ConvertFrom-Json
     $entry = $map | Where-Object { $_.target -eq $TargetName } | Select-Object -First 1
     if ($entry) { return $entry.value }
   }
@@ -291,18 +332,28 @@ function Test-NetEnvEgress {
   # （实测同一节点 curl -k 能拿到 401，而默认校验报 SEC_E_CERT_EXPIRED），
   # 而 mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康。
   if ($VerifyCert) {
+    # 无 curl 的机器退回 Invoke-WebRequest（.NET/schannel 默认即校验证书），语义一致
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+      return Test-NetEnvEgress -ProbeUrl $ProbeUrl -TimeoutSec $TimeoutSec -ProxyPort $ProxyPort
+    }
     # 用 --silent --show-error 会在失败时把 curl 的 stderr 直接喷到控制台（污染 doctor 输出），
-    # 因此这里完全静默，只取 http_code；失败原因由 Exit 状态与空 code 推断。
+    # 因此这里完全静默，只取 http_code + 退出码；失败原因由两者推断。
     $out = & curl.exe -s -o NUL -w '%{http_code}' -x ("http://127.0.0.1:$ProxyPort") --connect-timeout $TimeoutSec --max-time ($TimeoutSec * 3) $ProbeUrl 2>$null
-    $code = ($out -join '')
-    $ok = ($code -match '^\d{3}$')
+    $curlExit = $LASTEXITCODE
+    $code = ($out -join '').Trim()
+    # 关键：curl 连接/TLS 失败时 http_code 是 '000'，它也满足"3 位数字"。
+    # 只判位数会把 schannel 握手失败（exit 35）误报成"证书有效"（实测 doctor 曾输出
+    # "HTTP 0 in 29486ms（证书有效）"），MITM 检测形同虚设。
+    $ok = ($curlExit -eq 0 -and $code -match '^[1-9]\d{2}$')
     $sw.Stop()
     return [PSCustomObject]@{
       Ok    = $ok
       Status = if ($ok) { [int]$code } else { 0 }
       Ms    = $sw.ElapsedMilliseconds
       Url   = $ProbeUrl
-      Error = if ($ok) { $null } else { if ($code) { $code } else { 'TLS/证书校验失败（节点可能呈现过期或伪造证书）' } }
+      Error = if ($ok) { $null }
+              elseif (-not $code -or $code -eq '000') { "curl 未能建立连接（exit=$curlExit；证书校验失败/超时/代理不可达）" }
+              else { "HTTP $code (curl exit=$curlExit)" }
     }
   }
 

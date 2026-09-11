@@ -82,9 +82,16 @@ try {
     'bootstrap' { . "$PSScriptRoot\lib\bootstrap.ps1"; Invoke-NetEnvBootstrap -Force:($Rest -contains '--force') }
     'clean' {
       $paths = Get-NetEnvPaths
-      Get-ChildItem -LiteralPath $paths.Logs -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } | Remove-Item -Force
+      # 保留天数只认 logging.rotateDays（与 Write-NetEnvLog 用同一来源），
+      # 原先这里写死 30 天而配置是 14 天，两处口径不一致
+      $cfgQuiet = Read-NetEnvConfig -Quiet
+      $rotateDays = 14
+      if ($cfgQuiet -and $cfgQuiet.logging -and $cfgQuiet.logging.rotateDays) { $rotateDays = [int]$cfgQuiet.logging.rotateDays }
+      if ($rotateDays -lt 1) { $rotateDays = 14 }
+      $old = @(Get-ChildItem -LiteralPath $paths.Logs -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$rotateDays) })
+      $old | Remove-Item -Force -ErrorAction SilentlyContinue
       Get-ChildItem -LiteralPath $env:TEMP -Filter 'netenv-secrets-*' -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-      'clean 完成'
+      "clean 完成：清理 $($old.Count) 个超过 $rotateDays 天的日志"
     }
     'config' {
       $sub = $Rest[0]

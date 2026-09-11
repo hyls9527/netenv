@@ -88,9 +88,18 @@ function Invoke-NetEnvNodesRefresh {
     }
   }
 
+  $mergedFile = Join-Path $paths.Data 'merged.yaml'
+  $mergedEmpty = $false
   if ($anyOk) {
     $merged = Build-NetEnvMergedConfig $subDir $cfg
-    Set-Content -LiteralPath (Join-Path $paths.Data 'merged.yaml') -Value $merged -Encoding utf8
+    if ($merged -and $merged.Trim().Length -gt 0) {
+      Save-NetEnvTextFile -Path $mergedFile -Content $merged
+    } else {
+      # 源里有 proxies: 却一个可用节点都没产出（名字全被过滤、字段非法等）时，
+      # 绝不能写空配置 —— 旧 merged.yaml 是当前唯一可用出口，覆盖等于主动断网。
+      $mergedEmpty = $true
+      Write-NetEnvLog 'WARN' 'nodes refresh: 无可用节点，保留旧 merged.yaml（原因为名字过滤/字段非法）'
+    }
   }
 
   $totalNodes = 0
@@ -100,12 +109,13 @@ function Invoke-NetEnvNodesRefresh {
   $state = [ordered]@{
     updatedAt = (Get-Date -Format 's')
     nodeCount = $totalNodes
+    mergedEmpty = $mergedEmpty
     sourceStatus = $sourceStatus
-    hash = if (Test-Path -LiteralPath (Join-Path $paths.Data 'merged.yaml')) {
-      (Get-FileHash -LiteralPath (Join-Path $paths.Data 'merged.yaml') -Algorithm SHA256).Hash
+    hash = if (Test-Path -LiteralPath $mergedFile) {
+      (Get-FileHash -LiteralPath $mergedFile -Algorithm SHA256).Hash
     } else { '' }
   }
-  $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $paths.Data 'sub-state.json') -Encoding utf8
+  Save-NetEnvTextFile -Path (Join-Path $paths.Data 'sub-state.json') -Content ($state | ConvertTo-Json -Depth 4)
   return $state
 }
 

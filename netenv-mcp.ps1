@@ -70,7 +70,7 @@ while ($true) {
           'netenv_nodes_summary' {
             $st = Join-Path $paths.Data 'sub-state.json'
             if (Test-Path -LiteralPath $st) {
-              $s = Get-Content -LiteralPath $st -Raw | ConvertFrom-Json
+              $s = (Read-NetEnvFileText $st) | ConvertFrom-Json
               $text = ([PSCustomObject]@{ updatedAt = $s.updatedAt; nodeCount = $s.nodeCount; sourceStatus = $s.sourceStatus }) | ConvertTo-Json -Compress
             } else {
               $text = ([PSCustomObject]@{ initialized = $false; nodeCount = 0; note = '尚未执行 nodes refresh' }) | ConvertTo-Json -Compress

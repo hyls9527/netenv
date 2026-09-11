@@ -33,7 +33,7 @@ while ($true) {
     $lastProbe = Get-Date
     $st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null }
     if (Test-Path -LiteralPath $healthFile) {
-      try { $st = Get-Content -LiteralPath $healthFile -Raw | ConvertFrom-Json } catch { }
+      try { $st = (Read-NetEnvFileText $healthFile) | ConvertFrom-Json } catch { Write-NetEnvLog 'WARN' 'supervisor-loop: health-state.json 不可解析，已重置' }
     }
     $r = Test-NetEnvEgress -ProbeUrl $probeUrl
     $st.probedAt = (Get-Date -Format 's')
@@ -78,7 +78,7 @@ while ($true) {
         }
       }
     }
-    try { $st | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $healthFile -Encoding utf8 } catch { }
+    try { Save-NetEnvTextFile -Path $healthFile -Content ($st | ConvertTo-Json -Depth 3) } catch { }
   }
 
   Start-Sleep -Seconds ($interval * 60)

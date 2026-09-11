@@ -25,7 +25,8 @@ function Invoke-NetEnvApply {
       npm config set proxy $npmProxy 2>$null | Out-Null
       npm config set https-proxy $npmHttps 2>$null | Out-Null
     }
-    foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY') {
+    # 快照记录了大小写各 6 个变量，回滚必须成对还原：只还原大写会把小写残留留下
+    foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy') {
       [Environment]::SetEnvironmentVariable($n, $snap.env.$n, 'User')
     }
     Write-NetEnvLog 'INFO' "apply --undo 使用快照 $SnapshotFile"
@@ -35,7 +36,10 @@ function Invoke-NetEnvApply {
   $prof = $cfg.profiles.$Profile
   $snapFile = Save-NetEnvSnapshot -Label "apply-$Profile"
 
-  $proxyServer = if ($prof.systemProxy) { 'http=127.0.0.1:7897;https=127.0.0.1:7897' } else { $null }
+  # 端口一律从端口表派生，避免改 netenv.json 后与 mihomo 实际监听端口漂移
+  $proxyUrl = Get-NetEnvProxyUrl $cfg
+  $proxyHostPort = $proxyUrl -replace '^https?://', ''
+  $proxyServer = if ($prof.systemProxy) { "http=$proxyHostPort;https=$proxyHostPort" } else { $null }
   $override = if ($prof.systemProxy) { ($cfg.noProxy -join ';') } else { $null }
   Set-NetEnvProxyReg ([int][bool]$prof.systemProxy) $proxyServer $override
   Set-NetEnvGitProxy $prof.gitProxy
@@ -49,7 +53,7 @@ function Invoke-NetEnvApply {
   }
 
   foreach ($n in 'HTTP_PROXY','HTTPS_PROXY') {
-    $val = if ($prof.envProxy) { 'http://127.0.0.1:7897' } else { $null }
+    $val = if ($prof.envProxy) { $proxyUrl } else { $null }
     [Environment]::SetEnvironmentVariable($n, $val, 'User')
   }
   $noProxyVal = if ($prof.envProxy) { ($cfg.noProxy -join ',') } else { $null }

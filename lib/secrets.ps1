@@ -46,7 +46,7 @@ function Invoke-NetEnvSecretsScan {
     $tokenCount = 0
     if ((Get-Item -LiteralPath $f -Force).PSIsContainer) { continue }
     try {
-      $raw = Get-Content -LiteralPath $f -Raw -ErrorAction Stop
+      $raw = Read-NetEnvFileText $f
       $tokenCount = ([regex]::Matches($raw, $script:GithubTokenPattern)).Count
       if ($raw -match '(?i)(password|secret|cookie|apikey|api_key|token|authorization)') { $kind = 'sensitive' }
     } catch { $kind = 'unreadable' }
@@ -133,7 +133,9 @@ function Invoke-NetEnvSecretsArchive {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archive)) { throw "7z 打包失败（$sevenZip 退出码 $LASTEXITCODE）" }
 
     $manifestFile = Join-Path $ArchiveDir "$($cfg.secrets.archivePrefix)-$ts-manifest.json"
-    @{ archive = $archive; generatedAt = (Get-Date -Format 's'); entries = @($manifest); skipped = @($skipped) } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $manifestFile -Encoding utf8
+    # ToArray()：PS 5.1 下 @($List[object]) 会抛 "Argument types do not match"（见 doctor.ps1 同处注释）
+    $manifestJson = @{ archive = $archive; generatedAt = (Get-Date -Format 's'); entries = $manifest.ToArray(); skipped = $skipped.ToArray() } | ConvertTo-Json -Depth 3
+    Save-NetEnvTextFile -Path $manifestFile -Content $manifestJson
 
     Write-NetEnvLog 'INFO' "secrets archive 已生成: $archive（$($manifest.Count) 项，密码不落盘）"
     return [PSCustomObject]@{
@@ -154,7 +156,9 @@ function Invoke-NetEnvSecretsPurge {
   $cfg = Read-NetEnvConfig
   $report = (New-Object System.Collections.Generic.List[object])
   foreach ($f in (Get-NetEnvSecretTargets)) {
-    $raw = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue
+    # 文件可能被占用/无权限：必须逐项跳过，不能让 purge 整体中断
+    $raw = ''
+    try { $raw = Read-NetEnvFileText $f } catch { continue }
     if (-not $raw) { continue }
     $tokens = [regex]::Matches($raw, $script:GithubTokenPattern)
     $badTokens = @()
@@ -171,7 +175,8 @@ function Invoke-NetEnvSecretsPurge {
       Copy-Item -LiteralPath $f -Destination $bak -Force
       $new = $raw
       foreach ($bad in $badTokens) { $new = $new.Replace($bad, '') }
-      Set-Content -LiteralPath $f -Value $new -NoNewline -Encoding utf8
+      # BOM-less 原子写：Set-Content -Encoding utf8 在 5.1 会加 BOM，改坏 .env/.credentials.yaml 的消费者
+      Save-NetEnvTextFile -Path $f -Content $new
       $report.Add([PSCustomObject]@{ Path = $f; Removed = $badTokens.Count; Backup = $bak })
     }
   }

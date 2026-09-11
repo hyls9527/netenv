@@ -28,6 +28,7 @@ function Invoke-NetEnvClientsCheck {
 
 function Invoke-NetEnvClientsApply {
   $cfg = Read-NetEnvConfig
+  $proxyUrl = Get-NetEnvProxyUrl $cfg
   $written = (New-Object System.Collections.Generic.List[string])
   foreach ($c in (Read-NetEnvJson -Name 'clients')) {
     foreach ($rawPath in $c.configPaths) {
@@ -38,14 +39,15 @@ function Invoke-NetEnvClientsApply {
       $envFile = Join-Path $dir 'NetEnv.env'
       $content = @"
 # NetEnv 注入（自动生成，勿手改；由 netenv clients apply 维护）
-HTTP_PROXY=http://127.0.0.1:7897
-HTTPS_PROXY=http://127.0.0.1:7897
+HTTP_PROXY=$proxyUrl
+HTTPS_PROXY=$proxyUrl
 NO_PROXY=$($cfg.noProxy -join ',')
 NETENV_BASE_URL=$($c.baseUrl)
 "@
       $bak = "$envFile.bak"
       if (Test-Path -LiteralPath $envFile) { Copy-Item -LiteralPath $envFile -Destination $bak -Force }
-      Set-Content -LiteralPath $envFile -Value $content -Encoding utf8
+      # 不用 Set-Content -Encoding utf8（PS 5.1 会加 BOM）：.env 带 BOM 会让部分解析器把首个键读坏
+      Save-NetEnvTextFile -Path $envFile -Content $content
       $written.Add($envFile)
     }
   }

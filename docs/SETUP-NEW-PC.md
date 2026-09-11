@@ -1,8 +1,9 @@
 # 新电脑装配
 
 1. 复制便携包或 `export/` 迁移包到新机。
-   - **PowerShell 7（`pwsh`）非必需**：全部脚本兼容 Windows PowerShell 5.1。若只有 5.1，不要执行 `install` 的默认计划任务（其 `-Execute 'pwsh.exe'` 会失败），改用下方"便携模式"。
-2. `.\netenv.ps1 setup --apply`：镜像下载 mihomo/new-api（SHA256 校验）→ 安装到 `%LOCALAPPDATA%\NetEnv` → 注册 5 分钟 supervisor 计划任务 → `apply -profile proxy` → `nodes refresh` → `clients apply` → doctor 校验。
+   - **PowerShell 7（`pwsh`）非必需**：全部脚本兼容 Windows PowerShell 5.1。
+     `install --autostart` 用 `wscript.exe` + `lib\run-supervisor-hidden.vbs` 注册计划任务，与 PATH 里有没有 `pwsh.exe` 无关（但要管理员权限）；无管理员权限时用下方"便携模式"。
+2. `.\netenv.ps1 setup --apply`：镜像下载 mihomo/new-api（SHA256 校验）→ 安装到 `%LOCALAPPDATA%\NetEnv` → 注册开机 + 每 5 分钟两条 supervisor 计划任务（需管理员）→ `apply -profile proxy` → `nodes refresh` → `clients apply` → doctor 校验。
 3. 凭据重建：`netenv config set-secret NetEnv/sub-<id> <URL>`（订阅）、`gh auth login`（GitHub）、new-api 上游渠道自行添加。
 4. 卸载：`netenv uninstall`；回滚：`netenv apply --undo`。
 

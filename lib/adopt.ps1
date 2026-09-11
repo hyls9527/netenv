@@ -10,10 +10,10 @@ function Invoke-NetEnvAdopt {
 
   if ($Undo) {
     if (-not (Test-Path -LiteralPath $ReportFile)) { throw "报告不存在: $ReportFile" }
-    $rep = Get-Content -LiteralPath $ReportFile -Raw | ConvertFrom-Json
+    $rep = (Read-NetEnvFileText $ReportFile) | ConvertFrom-Json
     foreach ($t in $rep.taskBackups) {
       if (Test-Path -LiteralPath $t.xml) {
-        Register-ScheduledTask -TaskName $t.name -Xml (Get-Content -LiteralPath $t.xml -Raw) -Force | Out-Null
+        Register-ScheduledTask -TaskName $t.name -Xml (Read-NetEnvFileText $t.xml) -Force | Out-Null
       }
     }
     foreach ($s in $rep.startupBackups) {
@@ -87,7 +87,7 @@ function Invoke-NetEnvAdopt {
     $report.dryRun = $false
   }
 
-  $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ReportFile -Encoding utf8
+  Save-NetEnvTextFile -Path $ReportFile -Content ($report | ConvertTo-Json -Depth 5)
   Write-NetEnvLog 'INFO' "adopt $(if ($Apply) {'执行'} else {'dry-run'}) 完成: $ReportFile"
   if ($Apply) { "adopt 已执行。归档密码（仅显示一次，请抄录）: $Password" }
   return $ReportFile
