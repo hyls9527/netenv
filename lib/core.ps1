@@ -34,6 +34,18 @@ function Get-NetEnvProxyUrl {
   return "http://127.0.0.1:$port"
 }
 
+# 当前生效档位需从三处实际状态推断：系统代理 / git 代理 / 用户环境变量。
+# 只认 ProxyEnable 会把 github 档（只注入 git 代理）误报成 direct（见 status.ps1 历史注释）。
+# doctor 与 status 共用本函数，避免两处判据各写一份而漂移。
+function Get-NetEnvActiveProfile {
+  $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+  if ($ie.ProxyEnable) { return 'proxy' }
+  $gitProxy = (git config --global --get http.proxy 2>$null)
+  $envProxy = [Environment]::GetEnvironmentVariable('HTTP_PROXY', 'User')
+  if ($gitProxy -or $envProxy) { return 'github' }
+  return 'direct'
+}
+
 function Get-NetEnvPaths {
   $cfg = Read-NetEnvConfig -Quiet
   if ($cfg.mode -eq 'installed') {
@@ -191,7 +203,9 @@ function Save-NetEnvSnapshot {
     }
     env = @{}
   }
-  foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy') {
+  # NODE_USE_ENV_PROXY 必须一并快照：apply 会按档位置 1 / 清空，漏了它 --undo 后会留下
+  # "开关开着却没有代理"（或反之）的半套状态。
+  foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','NODE_USE_ENV_PROXY','http_proxy','https_proxy','no_proxy') {
     $snap.env[$n] = [Environment]::GetEnvironmentVariable($n, 'User')
   }
   $file = Join-Path $snapDir ("snap-{0}-{1}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), ($Label -replace '[^\w-]','_'))

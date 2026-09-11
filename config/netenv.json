@@ -37,28 +37,24 @@
                              "*.qq.com/mail",
                              "163.com",
                              "abchina.com",
-                             "api.github.com",
                              "bankofchina.com",
                              "ccb.com",
                              "cmbchina.com",
-                             "codeload.github.com",
                              "icbc.com.cn",
                              "login.microsoftonline.com",
                              "outlook.com",
                              "psbc.com",
                              "qq.com",
-                             "release-assets.githubusercontent.com",
-                             "ssh.github.com"
+                             "release-assets.githubusercontent.com"
                          ],
-    "githubAuthDomains":  [
-                              "api.github.com",
-                              "codeload.github.com",
-                              "ssh.github.com"
-                          ],
+    "githubAuthDomains":  [],
     "githubAdaptiveDomains":  [
+                                  "api.github.com",
+                                  "codeload.github.com",
                                   "github.com",
                                   "objects.githubusercontent.com",
-                                  "raw.githubusercontent.com"
+                                  "raw.githubusercontent.com",
+                                  "ssh.github.com"
                               ],
     "subscription":  {
                          "urlTest":  {
@@ -86,10 +82,7 @@
                     "172.16.0.0/12",
                     "192.168.*",
                     "192.168.0.0/16",
-                    "api.github.com",
-                    "codeload.github.com",
-                    "localhost",
-                    "ssh.github.com"
+                    "localhost"
                 ],
     "profiles":  {
                      "direct":  {

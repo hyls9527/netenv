@@ -149,10 +149,11 @@ proxies:
       $out | Should Match 'name: proxy-select'
       # 自适应组选点依据必须是 github 自身端点
       $out | Should Match 'https://github.com/robots.txt'
-      # 凭据端点强制直连
-      $out | Should Match 'DOMAIN-SUFFIX,api.github.com,DIRECT'
-      $out | Should Match 'DOMAIN-SUFFIX,codeload.github.com,DIRECT'
-      $out | Should Match 'DOMAIN-SUFFIX,ssh.github.com,DIRECT'
+      # 凭据端点走 github-adaptive（组内同时持有 proxy-select 与 DIRECT，按 github 端点探活做双向保底）
+      # 变更原因见 docs/GITHUB-SAFETY.md：强制直连在直连抖动时没有退路，实测导致 clone / device flow 失败
+      $out | Should Match 'DOMAIN-SUFFIX,api.github.com,github-adaptive'
+      $out | Should Match 'DOMAIN-SUFFIX,codeload.github.com,github-adaptive'
+      $out | Should Match 'DOMAIN-SUFFIX,ssh.github.com,github-adaptive'
       # 内容域走自适应（可用性保底）
       $out | Should Match 'DOMAIN-SUFFIX,github.com,github-adaptive'
       # 同一域名不得重复出规则

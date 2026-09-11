@@ -37,13 +37,30 @@ function Invoke-NetEnvDoctor {
   $winhttp = (netsh winhttp show proxy 2>$null | Select-String 'Direct access' | Measure-Object).Count
   Add-Check 'winhttp' 'WinHTTP(仅记录)' $true ("状态: $(if ($winhttp -gt 0) {'直连'} else {'非直连'})")
 
-  # 环境变量
-  $envBad = @()
-  foreach ($n in 'HTTP_PROXY','HTTPS_PROXY') {
+  # 环境变量：判据必须与档位一致 —— proxy 档（envProxy=true）下这组变量是预期配置，
+  # 只有 direct/github 档（envProxy=false）才把它们当"残留"。
+  # 此前一律判残留，等于 apply -profile proxy 之后 doctor 必然失败（工具自相矛盾）。
+  $activeProfile = Get-NetEnvActiveProfile
+  $expectsEnvProxy = [bool]$cfg.profiles.$activeProfile.envProxy
+  $envSet = @(foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NODE_USE_ENV_PROXY') {
     $v = [Environment]::GetEnvironmentVariable($n, 'User')
-    if ($v) { $envBad += "$n=$v" }
+    if ($v) { "$n=$v" }
+  })
+  if ($expectsEnvProxy) {
+    $wantUrl = Get-NetEnvProxyUrl $cfg
+    $missing = @(@('HTTP_PROXY','HTTPS_PROXY') | Where-Object { [Environment]::GetEnvironmentVariable($_, 'User') -ne $wantUrl })
+    $nodeOn = ([Environment]::GetEnvironmentVariable('NODE_USE_ENV_PROXY', 'User') -eq '1')
+    $envOk = ($missing.Count -eq 0) -and $nodeOn
+    $envDetail = if ($envOk) {
+      "profile=$activeProfile 已按档位注入（$(ConvertTo-Redacted ($envSet -join '; '))）"
+    } else {
+      "profile=$activeProfile 期望 HTTP(S)_PROXY=$wantUrl 且 NODE_USE_ENV_PROXY=1；实际: $(if ($envSet) { ConvertTo-Redacted ($envSet -join '; ') } else { '未注入' })"
+    }
+  } else {
+    $envOk = ($envSet.Count -eq 0)
+    $envDetail = if ($envSet) { "profile=$activeProfile 不应注入，残留: $(ConvertTo-Redacted ($envSet -join '; '))" } else { "profile=$activeProfile，无残留" }
   }
-  Add-Check 'envvars' '用户代理环境变量' ($envBad.Count -eq 0) $(if ($envBad) { (ConvertTo-Redacted ($envBad -join '; ')) } else { '无残留' })
+  Add-Check 'envvars' '用户代理环境变量' $envOk $envDetail
 
   # git / npm
   $gitProxy = git config --global --get http.proxy 2>$null

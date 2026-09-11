@@ -36,14 +36,10 @@ function Get-NetEnvStatus {
     } catch { }
   }
 
+  # 档位推断统一走 Get-NetEnvActiveProfile：doctor 的 envvars 判据共用同一口径，
+  # 两处各写一份必然漂移（此前只认 ProxyEnable，github 档被误报成 direct）。
   $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
-  # profile 需从三处实际状态推断：系统代理 / git 代理 / 用户环境变量。
-  # 此前只认 ProxyEnable，导致 github 档（只注入 git 代理）被误报成 direct。
-  $gitProxy = (git config --global --get http.proxy 2>$null)
-  $envProxy = [Environment]::GetEnvironmentVariable('HTTP_PROXY', 'User')
-  $profile = 'direct'
-  if ($ie.ProxyEnable) { $profile = 'proxy' }
-  elseif ($gitProxy -or $envProxy) { $profile = 'github' }
+  $profile = Get-NetEnvActiveProfile
 
   $status = [ordered]@{
     initialized = Test-Path -LiteralPath (Join-Path $paths.Data 'initialized')

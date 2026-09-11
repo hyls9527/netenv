@@ -25,8 +25,9 @@ function Invoke-NetEnvApply {
       npm config set proxy $npmProxy 2>$null | Out-Null
       npm config set https-proxy $npmHttps 2>$null | Out-Null
     }
-    # 快照记录了大小写各 6 个变量，回滚必须成对还原：只还原大写会把小写残留留下
-    foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','http_proxy','https_proxy','no_proxy') {
+    # 快照同时记录大小写变体与 NODE_USE_ENV_PROXY，回滚必须全部还原：
+    # 只还原大写会把小写残留留下，漏掉 NODE_USE_ENV_PROXY 会留下与档位不符的 Node 代理开关。
+    foreach ($n in 'HTTP_PROXY','HTTPS_PROXY','NO_PROXY','NODE_USE_ENV_PROXY','http_proxy','https_proxy','no_proxy') {
       [Environment]::SetEnvironmentVariable($n, $snap.env.$n, 'User')
     }
     Write-NetEnvLog 'INFO' "apply --undo 使用快照 $SnapshotFile"
@@ -58,6 +59,11 @@ function Invoke-NetEnvApply {
   }
   $noProxyVal = if ($prof.envProxy) { ($cfg.noProxy -join ',') } else { $null }
   [Environment]::SetEnvironmentVariable('NO_PROXY', $noProxyVal, 'User')
+  # Node >= 24 的全局 fetch 默认不读 HTTP(S)_PROXY，必须显式 NODE_USE_ENV_PROXY=1 才会走代理
+  # （实测 Electron/Node 24.18.1：不设该变量直连 github.com 超时，设 1 后 device flow 200）。
+  # 与 envProxy 同生共死：direct/github 档必须清掉，否则留下"开关开着但没有代理"的半套状态。
+  $nodeEnvProxy = if ($prof.envProxy) { '1' } else { $null }
+  [Environment]::SetEnvironmentVariable('NODE_USE_ENV_PROXY', $nodeEnvProxy, 'User')
 
   Write-NetEnvLog 'INFO' "apply profile=$Profile 完成, 快照 $snapFile"
   "profile=$Profile 已应用。快照: $snapFile`n提示：已运行的程序需重启才会读取新的环境变量。"
