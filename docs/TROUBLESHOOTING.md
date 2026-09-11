@@ -30,3 +30,11 @@
   2. `$out | Should Match 'name: auto-select'` 断言组名 `auto-select`，但 `Build-NetEnvMergedConfig` 生成的是 `auto-urltest`。
   两者都是**测试与实现的历史漂移**（测试按 Pester 5 语法编写），需更新测试而非改配置。运行时功能不受影响。
 - 测试文件中的 `ghp_...` 字面量是**脱敏用例的样本值**，不是真实凭据，无需处理。
+- **`MethodNotFound: SHA256 不包含 HashData`**：`SHA256::HashData` / `Convert::ToHexString` / `MD5::HashData`
+  都是 .NET 5+ API，Windows PowerShell 5.1 的 .NET Framework 下不存在。需改用
+  `New-Object System.Security.Cryptography.SHA256Managed` + `ComputeHash` + 逐字节 `ToString('x2')`。
+- **`secrets archive` / `adopt -Apply` 报 `Parameter Paring Error`**：说明走的是 Bandizip 的 `bz.exe`，
+  而它**不兼容 7-Zip 参数语法**（`-t7z` / `-mhe=on` 均被拒）。已由 `Get-NetEnvArchiveArgs` 按工具分派：
+  7-Zip 用 `a -t7z -p<pw> -mhe=on`；Bandizip 用 `a -fmt:7z -p:<pw>`（其 7z 加密头默认开启，实测无密码无法列出条目名）。
+- **代理端口在听但打不开网页**：先跑 `netenv doctor`，看 `端到端出品（经代理实测）` 这一项。
+  它走真实请求，能区分"进程活着"与"出口可用"；`data/health-state.json` 记录连续失败次数。

@@ -8,7 +8,7 @@ function Invoke-NetEnvInstall {
   param([switch]$Autostart)
   $src = Get-NetEnvRoot
   $dest = Join-Path $env:LOCALAPPDATA 'NetEnv'
-  robocopy $src $dest /E /XD data logs backups export .git config /XF *.pdb | Out-Null
+  robocopy $src $dest /E /XD data logs backups export .git config tests /XF *.pdb | Out-Null
   New-Item -ItemType Directory -Path (Join-Path $dest 'config') -Force | Out-Null
   $localCfg = Join-Path $dest 'config\netenv.json'
   $cfg = Get-Content -LiteralPath $localCfg -Raw | ConvertFrom-Json

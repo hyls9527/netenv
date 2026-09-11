@@ -62,7 +62,8 @@ function Invoke-NetEnvAdopt {
       $archive = Join-Path $paths.Backups "adopt-overwall-$ts.7z"
       $sevenZip = Get-NetEnvSevenZip
       if (-not $sevenZip) { throw '未找到 7z 可执行文件（请安装 7-Zip，或用已安装的 Bandizip）' }
-      & $sevenZip a -t7z "-p$Password" -mhe=on $archive "$overwall\*" | Out-Null
+      $zargs = Get-NetEnvArchiveArgs -Exe $sevenZip -Archive $archive -Source "$overwall\*" -Password $Password
+      & $sevenZip @zargs | Out-Null
       $report.overwallArchive = $archive
     }
     foreach ($p in $oldProcs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }

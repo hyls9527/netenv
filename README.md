@@ -36,10 +36,13 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 
 ## 关键设计（不可关闭的底线）
 
-- **GitHub 认证流量强制直连**：`github.com` / `api.github.com` / `codeload.github.com` / `ssh.github.com` 不经过免费节点，凭据零明文（见 [docs/GITHUB-SAFETY.md](docs/GITHUB-SAFETY.md)）
+- **GitHub 可用性保底**：`github.com` 与两个内容域（`raw.githubusercontent.com` / `objects.githubusercontent.com`）交给 `github-adaptive` 组，
+  组内同时持有 `proxy-select` 与 `DIRECT`，按 github 自身端点探活后**自动择通择优** —— 直连抖动时自动改走节点，节点挂了自动回直连。
+  凭据端点（`api.github.com` / `codeload.github.com` / `ssh.github.com`）仍强制 `DIRECT`，不让免费节点经手（见 [docs/GITHUB-SAFETY.md](docs/GITHUB-SAFETY.md)）。
 - **`github-adaptive` 组的选点依据必须是 github 自身端点**，默认 `https://github.com/robots.txt`，可由 `config/netenv.json` 的 `subscription.githubUrlTest.url` 覆盖。
-  用 `google/gstatic` 之类的通用 URL 会得出错误结论 —— 节点能通 google 不代表能通 github，会把 `github.com` 判给机场节点，后果是访问变慢**且**认证流量被送上第三方节点。
-- **敏感域名直连**：`sensitiveDomains + githubAuthDomains` 生成 `DOMAIN-SUFFIX,<domain>,DIRECT` 规则
+  用 `google/gstatic` 之类的通用 URL 会得出错误结论 —— 节点能通 google 不代表能通 github（实测同一时刻 DIRECT 探活 504 而节点 921 ms）。
+- **敏感域名直连**：`sensitiveDomains + githubAuthDomains` 生成 `DOMAIN-SUFFIX,<domain>,DIRECT` 规则。
+  ⚠️ **同一域名不得同时出现在直连列表与 `githubAdaptiveDomains`**：DIRECT 规则在前会胜出，自适应规则永远不可达（曾是真实缺陷）。
 - **订阅仅 HTTPS**，剥离 `script` 等危险字段；订阅 URL 存 Windows 凭据管理器，不入盘
 - **代理面不对外**：mihomo 的 `mixed-port` / `http` / `external-controller` 均绑定 `127.0.0.1`，`allow-lan: false`
 - **`.ps1` 一律带 UTF-8 BOM**：脚本含中文，且计划任务以 `powershell.exe`（Windows PowerShell 5.1）`-File` 方式执行；无 BOM 时 5.1 会按 ANSI/GBK 解码导致中文乱码。**改动任何 `.ps1` 后请复查 BOM。**
@@ -49,7 +52,12 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 
 ## 常驻与自愈
 
-- 计划任务 `NetEnv-Supervisor`（开机）+ `NetEnv-Supervisor-Periodic`（定时）→ `lib\run-supervisor-hidden.vbs` → `lib\supervisor.ps1`：探活并拉起 mihomo / new-api
+- **双层健康判据**：`supervisor.ps1` 只负责进程存活（端口在听）；`supervisor-loop.ps1` 另按
+  `health.probeIntervalMinutes` 做**端到端出品探针**（真实经代理请求 `health.probeUrl`）。
+  端口在听 ≠ 能上网 —— 实测 423 个节点中仅 8 个能到 google，而端口照样 LISTEN。
+- **降级链**：探针连续失败达 `health.failThreshold` → 触发 `nodes refresh`（自带失败保留旧配置）
+  → 仍不可用且 `health.autoFallbackToDirect` 为真时回退 `apply -profile direct`。状态写入 `data/health-state.json`。
+- 计划任务 `NetEnv-Supervisor`（开机）+ `NetEnv-Supervisor-Periodic`（定时）→ `lib\run-supervisor-hidden.vbs` → `lib\supervisor-loop.ps1`：探活并拉起 mihomo / new-api
 - 日志按天轮转、脱敏，保留 30 天（`logs/`，不入库）
 - **订阅刷新不是自动的**：需手动 `nodes refresh`（或用你自己的调度；`merged.yaml` 的生成时间可在 `data/sub-state.json` 查看）
 - 非管理员可用的只读动作：`doctor` / `status`；`adopt -Apply` 等接管动作需要管理员权限

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Continue'
+﻿$ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $bin = Join-Path $root 'data\bin'
 $tmp = Join-Path $env:TEMP 'mihomo-official.zip'

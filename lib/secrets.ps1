@@ -30,8 +30,12 @@ function Get-NetEnvSecretTargets {
 
 function Get-TokenFingerprint {
   param([string]$Token)
-  $hash = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Token))
-  return ([Convert]::ToHexString($hash)).Substring(0, 8)
+  # 必须兼容 Windows PowerShell 5.1 的 .NET Framework：
+  # SHA256::HashData 与 Convert::ToHexString 是 .NET 5+ API，5.1 下会 MethodNotFound。
+  $sha = New-Object System.Security.Cryptography.SHA256Managed
+  try { $hash = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Token)) }
+  finally { $sha.Dispose() }
+  return (($hash | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
 }
 
 function Invoke-NetEnvSecretsScan {
@@ -124,8 +128,9 @@ function Invoke-NetEnvSecretsArchive {
     $archive = Join-Path $ArchiveDir "$($cfg.secrets.archivePrefix)-$ts.7z"
     $sevenZip = Get-NetEnvSevenZip
     if (-not $sevenZip) { throw '未找到 7z 可执行文件（请安装 7-Zip，或用已安装的 Bandizip）' }
-    & $sevenZip a -t7z "-p$Password" -mhe=on $archive (Join-Path $staging '*') | Out-Null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archive)) { throw '7z 打包失败' }
+    $zargs = Get-NetEnvArchiveArgs -Exe $sevenZip -Archive $archive -Source (Join-Path $staging '*') -Password $Password
+    & $sevenZip @zargs | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archive)) { throw "7z 打包失败（$sevenZip 退出码 $LASTEXITCODE）" }
 
     $manifestFile = Join-Path $ArchiveDir "$($cfg.secrets.archivePrefix)-$ts-manifest.json"
     @{ archive = $archive; generatedAt = (Get-Date -Format 's'); entries = @($manifest); skipped = @($skipped) } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $manifestFile -Encoding utf8

@@ -1,4 +1,4 @@
-param([string]$MessageFile, [switch]$Amend)
+﻿param([string]$MessageFile, [switch]$Amend)
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 $log = Join-Path $env:TEMP 'netenv-commit.log'

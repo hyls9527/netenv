@@ -1,4 +1,4 @@
-param([switch]$Live)
+﻿param([switch]$Live)
 $ErrorActionPreference = 'Stop'
 
 if ($Live) {

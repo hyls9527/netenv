@@ -36,7 +36,10 @@ NetEnv v1 — 统一网络代理层
 
 if (-not $Command -or $Command -in '-h','--help','help') { Show-NetEnvUsage; exit 0 }
 
-$lock = Enter-NetEnvLock
+# mcp 是常驻 stdio 循环、doctor/status 是只读操作：都不取实例锁，
+# 否则 MCP 会长期占用 data\netenv.lock，导致其他 netenv 命令一律被拒。
+$lock = $null
+if ($Command -notin @('mcp', 'doctor', 'status')) { $lock = Enter-NetEnvLock }
 try {
   switch ($Command) {
     'doctor' {

@@ -1,35 +1,47 @@
 ﻿. "$PSScriptRoot\core.ps1"
 
-function Ensure-NetEnvGeoIP {
+function Ensure-NetEnvGeodata {
+  # mihomo 启动时会自行去墙外下载缺失的 geodata，失败即整个配置加载失败。
+  # 规则同时用到 GEOSITE(需 GeoSite.dat) 与 GEOIP(需 geoip.metadb)，两者都要预置在 -d 数据根目录。
   $paths = Get-NetEnvPaths
-  $target = Join-Path $paths.Data 'geoip.metadb'
-  if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 1000000) { return $true }
-  $urls = @(
-    'https://gh-proxy.com/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb',
-    'https://ghfast.top/https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb'
+  $mirrors = @('https://gh-proxy.com/', 'https://ghfast.top/')
+  $targets = @(
+    @{ name = 'geoip.metadb'; rel = 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb' },
+    @{ name = 'GeoSite.dat';  rel = 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat' }
   )
-  foreach ($u in $urls) {
-    try {
-      & curl.exe -sS -L -C - --fail --connect-timeout 15 --max-time 300 -o $target $u
-      if ((Test-Path -LiteralPath $target) -and (Get-Item -LiteralPath $target).Length -gt 1000000) {
-        Write-NetEnvLog 'INFO' 'geoip.metadb 下载完成'
-        return $true
-      }
-    } catch { }
+  $allOk = $true
+  foreach ($t in $targets) {
+    $dest = Join-Path $paths.Data $t.name
+    if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -gt 1000000) { continue }
+    $got = $false
+    foreach ($m in $mirrors) {
+      try {
+        & curl.exe -sS -L -C - --fail --connect-timeout 15 --max-time 300 -o $dest ($m + $t.rel)
+        if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -gt 1000000) {
+          Write-NetEnvLog 'INFO' "$($t.name) 下载完成"
+          $got = $true
+          break
+        }
+      } catch { }
+    }
+    if (-not $got) {
+      Write-NetEnvLog 'WARN' "$($t.name) 下载失败（GEOSITE/GEOIP 规则将不可用，国内流量可能被误判走代理）"
+      $allOk = $false
+    }
   }
-  Write-NetEnvLog 'WARN' 'geoip.metadb 下载失败（国内直连分流将不可用）'
-  return $false
+  return $allOk
 }
 
 function Invoke-NetEnvNodesRefresh {
   $cfg = Read-NetEnvConfig
   $paths = Get-NetEnvPaths
-  $null = Ensure-NetEnvGeoIP
+  $null = Ensure-NetEnvGeodata
   $subDir = Join-Path $paths.Data 'subs'
   if (-not (Test-Path -LiteralPath $subDir)) { New-Item -ItemType Directory -Path $subDir -Force | Out-Null }
 
   $sourceStatus = @{}
   $anyOk = $false
+  $activeIds = New-Object System.Collections.ArrayList
   foreach ($src in (Read-NetEnvJson -Name 'sources')) {
     if ($src.disabled) {
       $sourceStatus[$src.id] = '已停用'
@@ -44,11 +56,12 @@ function Invoke-NetEnvNodesRefresh {
       $sourceStatus[$src.id] = '拒绝: 仅允许 HTTPS 订阅'
       continue
     }
+    [void]$activeIds.Add($src.id)
+    # 临时文件含订阅原文（凭据），用 finally 确保异常路径也不残留
+    $tmpSub = Join-Path $paths.Data ("dl-" + $src.id + ".sub")
     try {
-      $tmpSub = Join-Path $paths.Data ("dl-" + $src.id + ".sub")
       Invoke-WebRequest -Uri $url -OutFile $tmpSub -UseBasicParsing -TimeoutSec 30
       $text = [System.IO.File]::ReadAllText($tmpSub, [System.Text.Encoding]::UTF8)
-      Remove-Item -LiteralPath $tmpSub -Force -ErrorAction SilentlyContinue
       if ($text -match '(?m)^\s*proxies\s*:') {
         $sanitized = Remove-NetEnvDangerousFields $text
         $out = Join-Path $subDir "$($src.id).yaml"
@@ -62,6 +75,16 @@ function Invoke-NetEnvNodesRefresh {
       }
     } catch {
       $sourceStatus[$src.id] = "下载失败: $($_.Exception.Message)"
+    } finally {
+      if (Test-Path -LiteralPath $tmpSub) { Remove-Item -LiteralPath $tmpSub -Force -ErrorAction SilentlyContinue }
+    }
+  }
+
+  # 清理已删除/停用/未配置源的残留 yaml，否则旧节点会持续混进 merged.yaml
+  Get-ChildItem -LiteralPath $subDir -Filter '*.yaml' -ErrorAction SilentlyContinue | ForEach-Object {
+    if ($activeIds -notcontains $_.BaseName -and -not ($sourceStatus[$_.BaseName] -like 'OK,*')) {
+      Write-NetEnvLog 'INFO' "nodes refresh: 清理失效源残留 $($_.Name)"
+      Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
     }
   }
 
@@ -93,6 +116,8 @@ function Remove-NetEnvDangerousFields {
   $skipBlock = $false
   foreach ($line in $lines) {
     $line = $line -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', ''
+    # 行内流式写法（如 {script: ...}）也要剥离，否则过滤可被绕过
+    if ($line -match '(^|[\s,{])script\s*:') { continue }
     if ($line -match '^\s*script\s*:') { continue }
     if ($line -match '^\s*(cfw-bypass|cfw-latency|cfw-latency-timeout|prepend|append)\s*:') { continue }
     if ($line -match '^\s*proxy-providers\s*:') { $skipBlock = $true; continue }

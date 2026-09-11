@@ -16,6 +16,13 @@
                        "maxFailingRounds":  6,
                        "intervalMinutes":  1
                    },
+    "health":  {
+                   "probeUrl":  "https://www.google.com/generate_204",
+                   "probeIntervalMinutes":  5,
+                   "failThreshold":  2,
+                   "autoRefreshOnFail":  true,
+                   "autoFallbackToDirect":  false
+               },
     "sensitiveDomains":  [
                              "*.163.com/mail",
                              "*.abchina.com",
@@ -46,12 +53,12 @@
     "githubAuthDomains":  [
                               "api.github.com",
                               "codeload.github.com",
-                              "ssh.github.com",
-                              "raw.githubusercontent.com"
+                              "ssh.github.com"
                           ],
     "githubAdaptiveDomains":  [
                                   "github.com",
-                                  "objects.githubusercontent.com"
+                                  "objects.githubusercontent.com",
+                                  "raw.githubusercontent.com"
                               ],
     "subscription":  {
                          "urlTest":  {
@@ -62,7 +69,7 @@
                                      },
                          "githubUrlTest":  {
                                                "url":  "https://github.com/robots.txt",
-                                               "interval":  120,
+                                               "interval":  60,
                                                "tolerance":  50,
                                                "lazy":  true
                                            }
@@ -127,7 +134,8 @@
                     "archivePrefix":  "netenv-secrets"
                 },
     "optionalServices":  [
-                             "subStore"
+                             "subStore",
+                             "newApi"
                          ],
     "guardianTasks":  [
                           "AI-Stack-Guardian",

@@ -114,6 +114,34 @@ function Invoke-NetEnvDoctor {
   $backupCount = (Get-ChildItem -LiteralPath (Get-NetEnvPaths).Backups -Filter 'config-*' -ErrorAction SilentlyContinue | Measure-Object).Count
   Add-Check 'config' '配置校验与备份' ($cfgOk -and $backupCount -gt 0) "配置有效；备份 $backupCount 份"
 
+  # .ps1 必须带 UTF-8 BOM：无 BOM 时 Windows PowerShell 5.1 按 ANSI/GBK 解码，
+  # 中文注释会破坏引号配对并导致 ParseException（实测高频故障）
+  $noBom = (New-Object System.Collections.Generic.List[string])
+  Get-ChildItem -Path (Get-NetEnvRoot) -Recurse -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notmatch '\\tests\\' } | ForEach-Object {
+      $b = [System.IO.File]::ReadAllBytes($_.FullName)
+      $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+      if (-not $hasBom) { $noBom.Add($_.Name) }
+    }
+  Add-Check 'bom' '脚本 UTF-8 BOM' ($noBom.Count -eq 0) $(if ($noBom.Count) { "缺 BOM: $($noBom -join ', ')" } else { '全部运行时脚本均带 BOM' })
+
+  # geodata 完整性：mihomo 缺任一项会尝试联网自取，失败即整包配置加载失败
+  $geoMissing = (New-Object System.Collections.Generic.List[string])
+  foreach ($g in 'GeoSite.dat', 'geoip.metadb') {
+    $p = Join-Path (Get-NetEnvPaths).Data $g
+    if (-not (Test-Path -LiteralPath $p) -or (Get-Item -LiteralPath $p).Length -lt 1000000) { $geoMissing.Add($g) }
+  }
+  Add-Check 'geodata' 'geodata 预置' ($geoMissing.Count -eq 0) $(if ($geoMissing.Count) { "缺失/过小: $($geoMissing -join ', ')" } else { 'GeoSite.dat + geoip.metadb 就绪' })
+
+  # 端到端出品：端口在听不代表能上网（实测 423 节点中仅 8 个能到 google，端口照样 LISTEN）。
+  # 仅当 mihomo 端口已在监听时才探测，否则只会得到误导性的失败。
+  if (Get-PortOwner $cfg.ports.mihomoHttp) {
+    $eg = Test-NetEnvEgress -TimeoutSec 10
+    Add-Check 'egress' '端到端出品（经代理实测）' $eg.Ok $(if ($eg.Ok) { "HTTP $($eg.Status) in $($eg.Ms)ms" } else { "不可用: $($eg.Error)" })
+  } else {
+    Add-Check 'egress' '端到端出品（经代理实测）' $true 'mihomo 未监听，跳过'
+  }
+
   if ($Json) {
     return [PSCustomObject]@{ ok = ($script:fails -eq 0); fails = $script:fails; checks = @($checks) } | ConvertTo-Json -Depth 5
   }

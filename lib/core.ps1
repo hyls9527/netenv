@@ -81,8 +81,17 @@ function Write-NetEnvLog {
   $logFile = Join-Path $logDir "$(Get-Date -Format 'yyyyMMdd').log"
   $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, (ConvertTo-Redacted $Message)
   Add-Content -LiteralPath $logFile -Value $line
-  $cutoff = (Get-Date).AddDays(-((Read-NetEnvConfig -Quiet).logging.rotateDays))
-  Get-ChildItem -LiteralPath $logDir -Filter '*.log' | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
+  # 配置缺失/损坏时不得抛错（否则日志本身会打断主流程）；rotateDays 缺省 14
+  $rotateDays = 14
+  try {
+    $c = Read-NetEnvConfig -Quiet
+    if ($c -and $c.logging -and $c.logging.rotateDays) { $rotateDays = [int]$c.logging.rotateDays }
+  } catch { }
+  if ($rotateDays -lt 1) { $rotateDays = 14 }
+  $cutoff = (Get-Date).AddDays(-$rotateDays)
+  Get-ChildItem -LiteralPath $logDir -Filter '*.log' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt $cutoff } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
 function Test-IsAdmin {
@@ -94,8 +103,14 @@ function Get-PortOwner {
   param([int]$Port)
   $conn = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $conn) { return $null }
+  # 进程可能在枚举与查询之间退出，$proc 可能为 $null —— 不能直接访问属性
   $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-  return [PSCustomObject]@{ Port = $Port; Pid = $conn.OwningProcess; Process = $proc.ProcessName; Path = $proc.Path }
+  return [PSCustomObject]@{
+    Port    = $Port
+    Pid     = $conn.OwningProcess
+    Process = if ($proc) { $proc.ProcessName } else { '(已退出)' }
+    Path    = if ($proc) { $proc.Path } else { $null }
+  }
 }
 
 function Enter-NetEnvLock {
@@ -149,21 +164,50 @@ function Get-NetEnvSnapshot {
   return (Get-Content -LiteralPath $File -Raw | ConvertFrom-Json)
 }
 
-# 解析 7z 可执行文件（不写死安装路径；缺失时返回 $null，由调用方决定是否报错）
+# 解析 7z 可执行文件（不写死安装路径；缺失时返回 $null）。
+# 注意：Bandizip 的 bz.exe 与 7-Zip 参数语言不兼容（实测 -t7z/-mhe=on 均报 Parameter Paring Error），
+# 必须按工具分派参数，见 Get-NetEnvArchiveArgs。
 function Get-NetEnvSevenZip {
   $cands = @(
-    (Join-Path $env:ProgramFiles '7-Zip\7z.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\7-Zip\7z.exe'),
-    (Join-Path $env:ProgramFiles 'Bandizip\bz.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} 'Bandizip\bz.exe')
+    @{ p = (Join-Path $env:ProgramFiles '7-Zip\7z.exe');            style = '7zip' },
+    @{ p = (Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe');     style = '7zip' },
+    @{ p = (Join-Path $env:LOCALAPPDATA 'Programs\7-Zip\7z.exe');   style = '7zip' },
+    @{ p = (Join-Path $env:ProgramFiles 'Bandizip\bz.exe');         style = 'bandizip' },
+    @{ p = (Join-Path ${env:ProgramFiles(x86)} 'Bandizip\bz.exe');  style = 'bandizip' }
   )
-  foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+  foreach ($c in $cands) { if ($c.p -and (Test-Path -LiteralPath $c.p)) { return $c.p } }
   foreach ($n in '7z', '7za', 'bz') {
     $cmd = Get-Command $n -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
   }
   return $null
+}
+
+function Get-NetEnvArchiveStyle {
+  param([Parameter(Mandatory)][string]$Exe)
+  if ((Split-Path $Exe -Leaf) -match '^bz(\.exe)?$') { return 'bandizip' }
+  return '7zip'
+}
+
+# 返回归档参数数组（含命令字），调用方直接 & $exe @args
+function Get-NetEnvArchiveArgs {
+  param(
+    [Parameter(Mandatory)][string]$Exe,
+    [Parameter(Mandatory)][string]$Archive,
+    [Parameter(Mandatory)][string]$Source,
+    [string]$Password
+  )
+  if ((Get-NetEnvArchiveStyle $Exe) -eq 'bandizip') {
+    # -fmt:7z 指定 7z 格式；加密头默认开启（实测无密码无法列出条目名）
+    $a = @('a', '-fmt:7z', '-y')
+    if ($Password) { $a += ('-p:' + $Password) }
+    $a += @($Archive, $Source)
+    return $a
+  }
+  $a = @('a', '-t7z')
+  if ($Password) { $a += ('-p' + $Password); $a += '-mhe=on' }
+  $a += @($Archive, $Source)
+  return $a
 }
 
 function Get-GithubTokenStatus {
@@ -221,4 +265,34 @@ function Get-NetEnvCredentialValue {
     if ($entry) { return $entry.value }
   }
   return $null
+}
+
+# 端到端出品探针：真实经代理请求外网，回答"到底能不能上网"。
+# 端口在听 ≠ 可用（实测：423 节点里仅 8 个能到 google，端口照样 LISTEN），
+# 所以健康判据必须落到真实请求上，不能只看 Get-PortOwner。
+function Test-NetEnvEgress {
+  param(
+    [string]$ProbeUrl,
+    [int]$TimeoutSec = 8,
+    [int]$ProxyPort
+  )
+  $cfg = Read-NetEnvConfig -Quiet
+  if (-not $ProbeUrl) {
+    if ($cfg -and $cfg.health -and $cfg.health.probeUrl) { $ProbeUrl = $cfg.health.probeUrl }
+    else { $ProbeUrl = 'https://www.google.com/generate_204' }
+  }
+  if (-not $ProxyPort) {
+    if ($cfg -and $cfg.ports -and $cfg.ports.mihomoHttp) { $ProxyPort = [int]$cfg.ports.mihomoHttp } else { $ProxyPort = 7897 }
+  }
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  try {
+    $r = Invoke-WebRequest -Uri $ProbeUrl -Proxy ("http://127.0.0.1:$ProxyPort") -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+    $sw.Stop()
+    # 204/200/301/302 均视为出品可用（generate_204 正常返回 204）
+    $ok = ($r.StatusCode -ge 200 -and $r.StatusCode -lt 400)
+    return [PSCustomObject]@{ Ok = $ok; Status = [int]$r.StatusCode; Ms = $sw.ElapsedMilliseconds; Url = $ProbeUrl; Error = $null }
+  } catch {
+    $sw.Stop()
+    return [PSCustomObject]@{ Ok = $false; Status = 0; Ms = $sw.ElapsedMilliseconds; Url = $ProbeUrl; Error = $_.Exception.Message }
+  }
 }
