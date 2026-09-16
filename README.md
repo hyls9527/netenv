@@ -36,9 +36,11 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 
 ## 关键设计（不可关闭的底线）
 
-- **GitHub 可用性保底**：`github.com` 与两个内容域（`raw.githubusercontent.com` / `objects.githubusercontent.com`）交给 `github-adaptive` 组，
-  组内同时持有 `proxy-select` 与 `DIRECT`，按 github 自身端点探活后**自动择通择优** —— 直连抖动时自动改走节点，节点挂了自动回直连。
-  凭据端点（`api.github.com` / `codeload.github.com` / `ssh.github.com`）仍强制 `DIRECT`，不让免费节点经手（见 [docs/GITHUB-SAFETY.md](docs/GITHUB-SAFETY.md)）。
+- **GitHub 可用性保底**：`github.com`、两个内容域（`raw.githubusercontent.com` / `objects.githubusercontent.com`）**以及三个凭据端点**
+  （`api.github.com` / `codeload.github.com` / `ssh.github.com`）全部交给 `github-adaptive` 组，组内同时持有 `github-node` / `proxy-select` / `DIRECT`，
+  按 github 自身端点探活后**自动择通择优** —— 直连抖动时自动改走节点，节点挂了自动回直连。
+  凭据端点原设计强制 `DIRECT`，2026-09-11 因"直连抖动时没有任何退路，`git clone` 与 device-flow 登录直接失败"改为同组保底。
+  ⚠️ **知情选择：可用性优先，等于接受凭据流量经免费节点**（TLS 仍端到端加密，但出口节点可见目标元数据）；回退步骤见 [docs/GITHUB-SAFETY.md](docs/GITHUB-SAFETY.md)。
 - **`github-adaptive` 组的选点依据必须是 github 自身端点**，默认 `https://github.com/robots.txt`，可由 `config/netenv.json` 的 `subscription.githubUrlTest.url` 覆盖。
   用 `google/gstatic` 之类的通用 URL 会得出错误结论 —— 节点能通 google 不代表能通 github（实测同一时刻 DIRECT 探活 504 而节点 921 ms）。
 - **敏感域名直连**：`sensitiveDomains + githubAuthDomains` 生成 `DOMAIN-SUFFIX,<domain>,DIRECT` 规则。
@@ -53,10 +55,15 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 ## 常驻与自愈
 
 - **双层健康判据**：`supervisor.ps1` 只负责进程存活（端口在听）；`supervisor-loop.ps1` 另按
-  `health.probeIntervalMinutes` 做**端到端出品探针**（真实经代理请求 `health.probeUrl`）。
+  `health.probeIntervalMinutes` 做**端到端出品探针**（真实经代理请求 `health.probeUrls`，**任一目标可达即算可用**）。
   端口在听 ≠ 能上网 —— 实测 423 个节点中仅 8 个能到 google，而端口照样 LISTEN。
-- **降级链**：探针连续失败达 `health.failThreshold` → 触发 `nodes refresh`（自带失败保留旧配置）
-  → 仍不可用且 `health.autoFallbackToDirect` 为真时回退 `apply -profile direct`。状态写入 `data/health-state.json`。
+  判据取多目标 OR 而非单目标：单探 google 会把"google 被墙、github 正常"误判成整机出品不可用，
+  从而每 5 分钟空刷一次订阅源（真实故障，见 `logs/20260917.log`）。
+- **降级链**：探针连续失败达 `health.failThreshold` → 触发 `nodes refresh`（自带"失败保留旧配置"）
+  → **经控制器 `PUT /configs?force=true` 重载 mihomo**（刷新只改 `data/merged.yaml`；运行中的 mihomo 不会自己读新配置，
+  不重载则刷新出的节点永远不生效）→ 仍不可用且 `health.autoFallbackToDirect` 为真时回退 `apply -profile direct`。
+  状态写入 `data/health-state.json`；其中 `lastRefreshAt` 配合 `health.autoRefreshMinIntervalMinutes`（默认 30 分钟）
+  限制自动刷新频率，避免目标长期不可达时每 5 分钟锤一次订阅源。
 - 计划任务 `NetEnv-Supervisor`（开机）+ `NetEnv-Supervisor-Periodic`（每 5 分钟）→ `lib\run-supervisor-hidden.vbs` → `lib\supervisor-loop.ps1`：探活并拉起 mihomo / new-api
   - `install --autostart` 需要管理员权限；**两条任务都用 `wscript.exe` 启动 VBS，不依赖 PATH 里的 `pwsh.exe`**（PATH 缺 pwsh 时计划任务会静默失败），且不闪黑窗
   - VBS 内有**单实例守卫**：周期任务只在自愈循环已死时补拉，不会出现两个循环抢重启与日志

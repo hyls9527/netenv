@@ -20,8 +20,14 @@ Describe 'NetEnv 配置' {
     $cfg = Read-NetEnvConfig
     $cfg.health | Should Not BeNullOrEmpty
     $cfg.health.probeUrl | Should Match '^https://'
+    # probeUrls 是多目标 OR 判据的来源；每一项都必须合法，且第一项保持与 probeUrl 一致
+    @($cfg.health.probeUrls).Count | Should BeGreaterThan 0
+    @($cfg.health.probeUrls | Where-Object { $_ -notmatch '^https://' }).Count | Should Be 0
+    $cfg.health.probeUrls[0] | Should Be $cfg.health.probeUrl
     [int]$cfg.health.probeIntervalMinutes | Should BeGreaterThan 0
     [int]$cfg.health.failThreshold | Should BeGreaterThan 0
+    # 自动刷新的最小间隔：缺了它，目标长期不可达时每轮都去锤订阅源
+    [int]$cfg.health.autoRefreshMinIntervalMinutes | Should BeGreaterThan 0
   }
 
   It 'git 裸内容域不得同时出现在直连与自适应列表（否则自适应规则永不生效）' {
@@ -347,6 +353,97 @@ Describe 'install 配置种子' {
     } finally {
       $env:LOCALAPPDATA = $savedLocal
       Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Describe '自愈链完整性' {
+  It 'supervisor-loop 调用的 NetEnv 函数必须都能解析（曾漏 dot-source nodes.ps1）' {
+    # 背景：supervisor-loop.ps1 只 dot-source 了 core.ps1，却调用 nodes.ps1 里的
+    # Invoke-NetEnvNodesRefresh —— 一级降级每轮抛"无法将 ... 识别为 cmdlet"，
+    # 而且 $ErrorActionPreference='Continue' 让它既不中断也不被 doctor 发现，
+    # 静默失效 20 轮才被人看出来。这条守门就是为它加的。
+    $src = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $called = [regex]::Matches($src, '\b((?:Invoke|Test|Get|Set|Read|Save|Write|Update|ConvertTo|ConvertFrom|Remove|Ensure|Build|Start|Stop)-NetEnv[A-Za-z0-9]+)\b') |
+      ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    $local = [regex]::Matches($src, '(?m)^\s*function\s+([A-Za-z0-9\-]+)') | ForEach-Object { $_.Groups[1].Value }
+    $dotSourced = [regex]::Matches($src, '(?m)^\s*\.\s+"\$PSScriptRoot\\([A-Za-z0-9\-\.]+)"') | ForEach-Object { $_.Groups[1].Value }
+    $domains = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $dotSourced) {
+      $domains.Add((Read-NetEnvFileText (Join-Path $root ('lib\' + $f))))
+    }
+    $defined = [regex]::Matches(($domains -join "`n"), '(?m)^\s*function\s+([A-Za-z0-9\-]+)') | ForEach-Object { $_.Groups[1].Value }
+    $unresolved = @($called | Where-Object { $local -notcontains $_ -and $defined -notcontains $_ })
+    ($unresolved -join ', ') | Should Be ''
+  }
+
+  It '刷新后必须重载 mihomo（刷新只改 merged.yaml，运行中的 mihomo 不会自己读）' {
+    # 两半缺一不可：循环里要真的调用重载，core.ps1 里要有打到 external-controller 的实现。
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $loop | Should Match 'Update-NetEnvMihomoConfig -ControllerPort'
+    $core = Read-NetEnvFileText (Join-Path $root 'lib\core.ps1')
+    $core | Should Match 'function Update-NetEnvMihomoConfig'
+    $core | Should Match '/configs\?force=true'
+  }
+}
+
+Describe '出品探针多目标' {
+  It '首个目标失败、次个成功时判为可用（单目标实现会把整机误判成不可用）' {
+    # 用 script 作用域替换，Test-NetEnvEgressAny 定义在 core.ps1=脚本作用域，必然看到替换
+    $orig = (Get-Item function:script:Test-NetEnvEgress).ScriptBlock
+    try {
+      Set-Item function:script:Test-NetEnvEgress -Value {
+        param([string]$ProbeUrl, [int]$TimeoutSec, [int]$ProxyPort, [switch]$VerifyCert)
+        if ($ProbeUrl -match 'google') {
+          [PSCustomObject]@{ Ok = $false; Status = 0; Ms = 1; Url = $ProbeUrl; Error = 'timeout' }
+        } else {
+          [PSCustomObject]@{ Ok = $true; Status = 200; Ms = 7; Url = $ProbeUrl; Error = $null }
+        }
+      }
+      $ok = Test-NetEnvEgressAny -Urls @('https://www.google.com/generate_204', 'https://github.com/robots.txt') -TimeoutSec 1
+      $ok.Ok | Should Be $true
+      $ok.Url | Should Match 'github'
+
+      $bad = Test-NetEnvEgressAny -Urls @('https://www.google.com/generate_204') -TimeoutSec 1
+      $bad.Ok | Should Be $false
+      $bad.Error | Should Be 'timeout'
+
+      $none = Test-NetEnvEgressAny -Urls @() -TimeoutSec 1
+      ($none -eq $null) | Should Be $false
+    } finally {
+      Set-Item function:script:Test-NetEnvEgress -Value $orig
+    }
+  }
+}
+
+Describe '运行时脚本编码' {
+  It '所有 .ps1 必须带 UTF-8 BOM（无 BOM 时 5.1 按 GBK 解码，中文注释会破坏引号配对）' {
+    # 这不是洁癖：实测把 supervisor-loop.ps1 的 BOM 去掉后，powershell.exe 5.1 的
+    # Parser::ParseFile 直接报 6 个 "Unexpected token '}'" —— 编辑工具很容易顺手剥掉 BOM，
+    # 所以必须有测试兜住，而不是靠人记得复查。
+    $bad = New-Object System.Collections.Generic.List[string]
+    Get-ChildItem -Path $root -Recurse -File -Filter '*.ps1' | ForEach-Object {
+      $b = [System.IO.File]::ReadAllBytes($_.FullName)
+      if (-not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) {
+        $bad.Add($_.FullName.Replace($root, '').TrimStart('\'))
+      }
+    }
+    ($bad -join ', ') | Should Be ''
+  }
+}
+
+Describe '自愈链重载助手' {
+  It '配置文件不存在时返回 false，不抛错（重载失败不得打断自愈循环）' {
+    (Update-NetEnvMihomoConfig -ControllerPort 1 -ConfigPath (Join-Path $env:TEMP 'netenv-no-such-merged.yaml')) | Should Be $false
+  }
+
+  It '控制器不可达时返回 false，不抛错' {
+    $tmp = Join-Path $env:TEMP ('netenv-reload-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.yaml')
+    Set-Content -LiteralPath $tmp -Value "rules:`n  - MATCH,DIRECT" -Encoding utf8
+    try {
+      (Update-NetEnvMihomoConfig -ControllerPort 1 -ConfigPath $tmp -TimeoutSec 2) | Should Be $false
+    } finally {
+      Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
   }
 }

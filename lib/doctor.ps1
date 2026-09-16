@@ -170,8 +170,10 @@ function Invoke-NetEnvDoctor {
   # 端到端出品：端口在听不代表能上网（实测 423 节点中仅 8 个能到 google，端口照样 LISTEN）。
   # 仅当 mihomo 端口已在监听时才探测，否则只会得到误导性的失败。
   if (Get-PortOwner $cfg.ports.mihomoHttp) {
-    $eg = Test-NetEnvEgress -TimeoutSec 10
-    Add-Check 'egress' '端到端出品（经代理实测）' $eg.Ok $(if ($eg.Ok) { "HTTP $($eg.Status) in $($eg.Ms)ms" } else { "不可用: $($eg.Error)" })
+    # 多目标 OR，与 supervisor-loop 共用 Test-NetEnvEgressAny：单目标（只有 google）
+    # 会把"google 不通但 github 正常"误判成整机出品不可用，见 core.ps1 该函数注释。
+    $eg = Test-NetEnvEgressAny -TimeoutSec 10
+    Add-Check 'egress' '端到端出品（经代理实测）' $eg.Ok $(if ($eg.Ok) { "HTTP $($eg.Status) in $($eg.Ms)ms ($($eg.Url))" } else { "全部目标不可用: $($eg.Error)" })
     # 证书校验：mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康
     $certUrl = if ($cfg.subscription.githubUrlTest.url) { $cfg.subscription.githubUrlTest.url } else { 'https://github.com/robots.txt' }
     $cert = Test-NetEnvEgress -ProbeUrl $certUrl -TimeoutSec 10 -VerifyCert

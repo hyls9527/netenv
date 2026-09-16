@@ -382,3 +382,56 @@ function Test-NetEnvEgress {
     return [PSCustomObject]@{ Ok = $false; Status = 0; Ms = $sw.ElapsedMilliseconds; Url = $ProbeUrl; Error = $_.Exception.Message }
   }
 }
+
+function Test-NetEnvEgressAny {
+  # 出品可用判据：health.probeUrls 里**任一**目标可达即算可用（首个成功即返回）。
+  # 为什么不能只认单目标：旧实现只探 health.probeUrl（google），而 google 在本机长期不可达、
+  # github 却正常 —— 单目标会把"这一个目标不通"直接判成整机出品不可用，于是自愈循环每 5 分钟
+  # 空刷一次订阅源（logs/20260917.log 实测连续 20 轮）。
+  # 兼容：probeUrls 缺省时退回单个 probeUrl，再退回内置 google；老配置零改动仍可用。
+  # doctor 与 supervisor-loop 共用本函数，保证两处口径一致。
+  param(
+    [string[]]$Urls,
+    [int]$TimeoutSec = 8
+  )
+  if (-not $Urls -or @($Urls).Count -eq 0) {
+    $cfg = Read-NetEnvConfig -Quiet
+    $Urls = @()
+    if ($cfg -and $cfg.health) {
+      if ($cfg.health.probeUrls) { $Urls = @($cfg.health.probeUrls) }
+      elseif ($cfg.health.probeUrl) { $Urls = @($cfg.health.probeUrl) }
+    }
+    if (@($Urls).Count -eq 0) { $Urls = @('https://www.google.com/generate_204') }
+  }
+  $last = $null
+  foreach ($u in @($Urls)) {
+    if (-not $u) { continue }
+    $r = Test-NetEnvEgress -ProbeUrl $u -TimeoutSec $TimeoutSec
+    if ($r.Ok) { return $r }
+    $last = $r
+  }
+  return $last
+}
+
+function Update-NetEnvMihomoConfig {
+  # 让运行中的 mihomo 重载配置（走 external-controller，不重启进程、不断监听）。
+  # 为什么必须有这一步：nodes refresh 只重写 data/merged.yaml，而 supervisor.ps1 仅在
+  # "端口没在听"时才拉起 mihomo —— 运行中的实例不会自己读新文件。少了重载，
+  # 降级链刷新出的新节点永远不生效（真实缺陷：一级降级做了 20 轮无用功）。
+  # 失败只记 WARN 并返回 $false，绝不让重载失败反过来打断自愈循环。
+  param(
+    [int]$ControllerPort = 19090,
+    [string]$ConfigPath,
+    [int]$TimeoutSec = 20
+  )
+  if (-not $ConfigPath -or -not (Test-Path -LiteralPath $ConfigPath)) { return $false }
+  $uri = "http://127.0.0.1:$ControllerPort/configs?force=true"
+  $body = (@{ path = $ConfigPath } | ConvertTo-Json)
+  try {
+    Invoke-WebRequest -Uri $uri -Method Put -Body $body -ContentType 'application/json' -UseBasicParsing -TimeoutSec $TimeoutSec | Out-Null
+    return $true
+  } catch {
+    Write-NetEnvLog 'WARN' "mihomo 配置重载失败（$uri）：$_"
+    return $false
+  }
+}
