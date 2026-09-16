@@ -59,6 +59,15 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   端口在听 ≠ 能上网 —— 实测 423 个节点中仅 8 个能到 google，而端口照样 LISTEN。
   判据取多目标 OR 而非单目标：单探 google 会把"google 被墙、github 正常"误判成整机出品不可用，
   从而每 5 分钟空刷一次订阅源（真实故障，见 `logs/20260917.log`）。
+- **github 专项探针（判据独立于上面的 OR）**：`health.githubProbe.enabled` 为真时，`supervisor-loop`
+  每轮再**单独**探一次 github（默认 `https://github.com/robots.txt`），连败达
+  `githubProbe.failThreshold` 即触发该组**重新测速择通**（`Invoke-NetEnvGithubGroupRecovery` →
+  `GET /group/<组>/delay`），复测通过则记 INFO，`recoverMinIntervalMinutes` 负责退避。
+  - **为什么必须独立**：出品判据是 OR，google 通时 github 单独挂掉**不会触发任何自愈** ——
+    实测 2026-09-17 `github.com` 经代理握手失败（`git push/clone` 全废），而 `health-state.json` 一路 `lastOk`。
+  - **为什么恢复动作不是刷订阅**：`github-adaptive` 组是 `lazy: true`（没流量就不测速），一旦某轮被判定
+    `alive:false` 就再没有流量进来、也就永远不再测速，坏状态被**冻结**；而组内节点其实健康
+    （同一次测速实测 `github-node` 595ms / `proxy-select` 686ms）。触发一次组测速即恢复，代价远低于刷订阅。
 - **降级链**：探针连续失败达 `health.failThreshold` → 触发 `nodes refresh`（自带"失败保留旧配置"）
   → **经控制器 `PUT /configs?force=true` 重载 mihomo**（刷新只改 `data/merged.yaml`；运行中的 mihomo 不会自己读新配置，
   不重载则刷新出的节点永远不生效）→ 仍不可用且 `health.autoFallbackToDirect` 为真时回退 `apply -profile direct`。

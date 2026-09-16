@@ -137,9 +137,16 @@ function Write-NetEnvLog {
   } catch { }
   if ($rotateDays -lt 1) { $rotateDays = 14 }
   $cutoff = (Get-Date).AddDays(-$rotateDays)
-  Get-ChildItem -LiteralPath $logDir -Filter '*.log' -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -lt $cutoff } |
-    Remove-Item -Force -ErrorAction SilentlyContinue
+  # 逐项显式传 -LiteralPath，不用管道直接喂 Remove-Item：无匹配项时管道为空，
+  # PowerShell 7 会在参数绑定阶段抛 "Remove-Item: missing path operand"（实测 7.6.6），
+  # 它不受 -ErrorAction 抑制、会从本函数逃出，而日志函数是主流程各处都在调的 —— 一旦逃出
+  # 就直接打断 supervisor-loop。5.1 下不抛，但目标运行时是 5.1、开发与测试常在 7，
+  # 写法必须在两者下都成立（本轮实测：原写法在 7 下抛，显式 LiteralPath 不抛）。
+  try {
+    Get-ChildItem -LiteralPath $logDir -Filter '*.log' -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -lt $cutoff } |
+      ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+  } catch { }
 }
 
 function Test-IsAdmin {
@@ -433,5 +440,46 @@ function Update-NetEnvMihomoConfig {
   } catch {
     Write-NetEnvLog 'WARN' "mihomo 配置重载失败（$uri）：$_"
     return $false
+  }
+}
+
+function Invoke-NetEnvGithubGroupRecovery {
+  # 触发 github-adaptive 组重新测速，让它在成员（github-node / proxy-select / DIRECT）间重新择通。
+  # 为什么是"组测速"而不是"刷订阅"：该组 lazy:true —— 没有流量就不测速；一旦某轮被判定
+  # alive:false，就再没有流量进来，也就永远不再测速，坏状态被永久冻结。
+  # 实测（2026-09-17）：github.com 经代理握手失败，而组内节点其实健康 —— 同一次测速里
+  # github-node 595ms / proxy-select 686ms；触发一次组测速即恢复 HTTP 200 / 0.53s。
+  # 走 external-controller 的 GET /group/<name>/delay：只读、不改配置、可反复执行。
+  # 失败只记 WARN 并返回 Ok=$false，绝不让它打断自愈循环（与 Update-NetEnvMihomoConfig 同约）。
+  param(
+    [string]$Group = 'github-adaptive',
+    [string]$TestUrl = 'https://github.com/robots.txt',
+    [int]$ControllerPort = 19090,
+    [int]$ProbeTimeoutMs = 5000,
+    [int]$TimeoutSec = 90
+  )
+  $escaped = [System.Uri]::EscapeDataString($TestUrl)
+  $uri = "http://127.0.0.1:$ControllerPort/group/$Group/delay?url=$escaped&timeout=$ProbeTimeoutMs"
+  try {
+    $r = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+    # 返回形如 {"github-node":595,"proxy-select":686}；探测失败的成员不出现在结果里。
+    # 只要有任一成员拿到正延迟，就说明组内存在可用出口。
+    $data = $r.Content | ConvertFrom-Json
+    $ok = $false
+    $pairs = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $data.PSObject.Properties) {
+      $ms = 0
+      try { $ms = [int]$p.Value } catch { $ms = 0 }
+      if ($ms -gt 0) { $ok = $true }
+      $pairs.Add(("{0}={1}ms" -f $p.Name, $ms))
+    }
+    return [PSCustomObject]@{
+      Ok     = $ok
+      Group  = $Group
+      Detail = ($pairs -join ', ')
+    }
+  } catch {
+    Write-NetEnvLog 'WARN' "github 组测速失败（$uri）：$_"
+    return [PSCustomObject]@{ Ok = $false; Group = $Group; Detail = $null }
   }
 }

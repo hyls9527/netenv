@@ -39,10 +39,31 @@ if ($cfg.health) {
 if ($probeInterval -lt 1) { $probeInterval = 15 }
 if ($failThreshold -lt 1) { $failThreshold = 2 }
 if ($refreshMinInterval -lt 0) { $refreshMinInterval = 0 }
+
+# github 专项探针的配置。判据独立于出品 OR（理由见下方探针块注释），恢复动作也独立。
+$githubProbeOn = $false
+$githubProbeUrls = @('https://github.com/robots.txt')
+$githubFailThreshold = 2
+$githubGroup = 'github-adaptive'
+$githubRecoverMinInterval = 10
+if ($cfg.health -and $cfg.health.githubProbe) {
+  $gp = $cfg.health.githubProbe
+  if ($null -ne $gp.enabled) { $githubProbeOn = [bool]$gp.enabled }
+  # 过滤空串：探针 URL 为空会让 Test-NetEnvEgress 回退到 health.probeUrl（google），那就探错了对象
+  if ($gp.probeUrls) { $githubProbeUrls = @($gp.probeUrls | Where-Object { $_ }) }
+  if (@($githubProbeUrls).Count -eq 0) { $githubProbeUrls = @('https://github.com/robots.txt') }
+  if ($gp.failThreshold) { $githubFailThreshold = [int]$gp.failThreshold }
+  if ($gp.group) { $githubGroup = [string]$gp.group }
+  if ($null -ne $gp.recoverMinIntervalMinutes) { $githubRecoverMinInterval = [int]$gp.recoverMinIntervalMinutes }
+}
+if ($githubFailThreshold -lt 1) { $githubFailThreshold = 2 }
+if ($githubRecoverMinInterval -lt 0) { $githubRecoverMinInterval = 0 }
+
 $controllerPort = 19090
 if ($cfg.ports -and $cfg.ports.mihomoController) { $controllerPort = [int]$cfg.ports.mihomoController }
 $mergedFile = Join-Path $paths.Data 'merged.yaml'
 Write-NetEnvLog 'INFO' "supervisor-loop: 启动，进程探活 $interval 分钟 / 出品探针 $probeInterval 分钟 / 目标 $($probeUrls -join ' | ')"
+if ($githubProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: github 专项探针 启用 / 目标 $($githubProbeUrls -join ' | ') / 连败 $githubFailThreshold 次触发 $githubGroup 组测速" }
 
 $healthFile = Join-Path $paths.Data 'health-state.json'
 $lastProbe = (Get-Date).AddMinutes(-$probeInterval - 1)
@@ -52,7 +73,9 @@ while ($true) {
 
   if (((Get-Date) - $lastProbe).TotalMinutes -ge $probeInterval) {
     $lastProbe = Get-Date
-    $st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null; lastRefreshAt = $null }
+    # 键必须齐全：下面的加载只遍历本哈希表的默认键，漏掉的键读不到已存值、每轮都被重置
+    # （与当年 lastRefreshAt 退避失效同一类坑）。
+    $st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null; lastRefreshAt = $null; githubConsecutiveFail = 0; githubLastOk = $null; githubLastError = $null; githubProbedAt = $null; githubLastRecoverAt = $null }
     if (Test-Path -LiteralPath $healthFile) {
       try {
         $loaded = (Read-NetEnvFileText $healthFile) | ConvertFrom-Json
@@ -124,6 +147,60 @@ while ($true) {
         }
       }
     }
+    # ---- github 专项探针：判据独立，不并入上面的出品 OR ----
+    # 为什么必须独立：上面的出品判据是"probeUrls 里任一可达即算可用"，google 通时
+    # github 单独挂掉不会触发任何自愈 —— 实测 2026-09-17 github.com 经代理握手失败，
+    # 而 health-state.json 一路 lastOk、无人恢复。而 git push/clone 全依赖 github，
+    # 静默不可用的代价远高于多发一次组测速。
+    if ($githubProbeOn) {
+      $gr = Test-NetEnvEgressAny -Urls $githubProbeUrls
+      $st.githubProbedAt = (Get-Date -Format 's')
+      if ($gr.Ok) {
+        if ([int]$st.githubConsecutiveFail -ne 0) { Write-NetEnvLog 'INFO' "github 探针恢复：HTTP $($gr.Status) $($gr.Ms)ms" }
+        $st.githubConsecutiveFail = 0
+        $st.githubLastOk = (Get-Date -Format 's')
+        $st.githubLastError = $null
+      } else {
+        $st.githubConsecutiveFail = [int]$st.githubConsecutiveFail + 1
+        $st.githubLastError = ConvertTo-Redacted $gr.Error
+        Write-NetEnvLog 'WARN' "github 探针失败（第 $($st.githubConsecutiveFail)/$githubFailThreshold 次）：$($st.githubLastError)"
+
+        if ([int]$st.githubConsecutiveFail -ge $githubFailThreshold) {
+          # 恢复动作刻意不同于出品降级链：github 挂多半是 URLTest 组状态陈旧（组内节点其实
+          # 健康 —— 同一次测速实测 github-node 595ms / proxy-select 686ms），所以先触发该组
+          # 重新测速择通。刷订阅只重写 merged.yaml、代价大且不对症，留给上面的出品链。
+          $lastGithubRecover = $null
+          if ($st.githubLastRecoverAt) {
+            try { $lastGithubRecover = [datetime]$st.githubLastRecoverAt } catch { $lastGithubRecover = $null }
+          }
+          if ($lastGithubRecover -and ((Get-Date) - $lastGithubRecover).TotalMinutes -lt $githubRecoverMinInterval) {
+            $gAgoMin = [int]((Get-Date) - $lastGithubRecover).TotalMinutes
+            Write-NetEnvLog 'WARN' "github 不可用，但距上次专项恢复仅 $gAgoMin 分钟（下限 $githubRecoverMinInterval 分钟），本轮跳过"
+          } else {
+            Write-NetEnvLog 'WARN' "github 不可用 → 触发 $githubGroup 组重新测速"
+            # 先记账再动手（同出品链口径）：测速自身抛错时同样要退避，否则每轮都重试
+            $st.githubLastRecoverAt = (Get-Date -Format 's')
+            $rec = Invoke-NetEnvGithubGroupRecovery -Group $githubGroup -TestUrl $githubProbeUrls[0] -ControllerPort $controllerPort
+            if ($rec.Ok) {
+              Write-NetEnvLog 'INFO' "组测速完成（$($rec.Detail)），复测中"
+              Start-Sleep -Seconds 3
+              $gr2 = Test-NetEnvEgressAny -Urls $githubProbeUrls
+              if ($gr2.Ok) {
+                Write-NetEnvLog 'INFO' "github 已恢复：HTTP $($gr2.Status) $($gr2.Ms)ms"
+                $st.githubConsecutiveFail = 0
+                $st.githubLastOk = (Get-Date -Format 's')
+                $st.githubLastError = $null
+              } else {
+                Write-NetEnvLog 'ERROR' "组测速后 github 仍不可用：$($gr2.Error)"
+              }
+            } else {
+              Write-NetEnvLog 'ERROR' "github 组测速未取到任何可用成员（$($rec.Detail)）"
+            }
+          }
+        }
+      }
+    }
+
     try { Save-NetEnvTextFile -Path $healthFile -Content ($st | ConvertTo-Json -Depth 3) } catch { }
   }
 

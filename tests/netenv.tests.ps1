@@ -36,6 +36,17 @@ Describe 'NetEnv 配置' {
     $overlap = @($cfg.githubAdaptiveDomains | Where-Object { $direct -contains $_ })
     $overlap.Count | Should Be 0
   }
+
+  It 'github 专项探针配置完整（判据独立于出品 OR，见 supervisor-loop 探针块）' {
+    $cfg = Read-NetEnvConfig
+    $cfg.health.githubProbe | Should Not BeNullOrEmpty
+    @($cfg.health.githubProbe.probeUrls).Count | Should BeGreaterThan 0
+    @($cfg.health.githubProbe.probeUrls | Where-Object { $_ -notmatch '^https://' }).Count | Should Be 0
+    [int]$cfg.health.githubProbe.failThreshold | Should BeGreaterThan 0
+    # 组名写错会让"恢复"打到不存在的组上，且失败现象与节点挂掉难以区分
+    $cfg.health.githubProbe.group | Should Be 'github-adaptive'
+    [int]$cfg.health.githubProbe.recoverMinIntervalMinutes | Should BeGreaterThan 0
+  }
 }
 
 Describe 'NetEnv 脱敏' {
@@ -384,6 +395,52 @@ Describe '自愈链完整性' {
     $core = Read-NetEnvFileText (Join-Path $root 'lib\core.ps1')
     $core | Should Match 'function Update-NetEnvMihomoConfig'
     $core | Should Match '/configs\?force=true'
+  }
+}
+
+Describe 'github 专项探针' {
+  It '组测速助手在控制器不可达时返回 Ok=$false 且不抛错（不得打断自愈循环）' {
+    # 与 Update-NetEnvMihomoConfig 同约：恢复动作失败只能记日志，绝不能让异常逃出去。
+    $r = Invoke-NetEnvGithubGroupRecovery -Group 'github-adaptive' -ControllerPort 1 -TimeoutSec 2
+    $r.Ok | Should Be $false
+    $r.Group | Should Be 'github-adaptive'
+  }
+
+  It '组名不存在时同样返回 Ok=$false 且不抛错' {
+    $r = Invoke-NetEnvGithubGroupRecovery -Group 'no-such-group-xyz' -ControllerPort 19090 -TimeoutSec 10
+    $r.Ok | Should Be $false
+  }
+
+  It 'supervisor-loop 必须独立探 github 并调用组测速恢复（只靠出品 OR 判据会漏）' {
+    # 背景：出品判据是多目标 OR（任一可达即算可用），google 通时 github 单独挂掉
+    # 不会触发任何自愈 —— 实测 2026-09-17 github.com 经代理握手失败，health-state.json
+    # 却一路 lastOk。而 git push/clone 全依赖 github，静默不可用代价高。
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $loop | Should Match 'githubProbe'
+    $loop | Should Match 'Invoke-NetEnvGithubGroupRecovery'
+    # 恢复动作要与出品链区分：github 挂多半是组状态陈旧，刷订阅不对症
+    $loop | Should Not Match 'github.*Invoke-NetEnvNodesRefresh'
+  }
+
+  It 'github 探针的状态键必须在 health-state 默认键表内（漏了会每轮被重置、阈值失效）' {
+    # 加载逻辑只遍历默认键表，未列入的键读不到已存值 —— 与当年 lastRefreshAt 退避
+    # 失效是同一类坑，故用静态守卫兜住。
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $m = [regex]::Match($loop, '(?m)^\s*\$st = @\{([^}]*)\}')
+    $m.Success | Should Be $true
+    foreach ($k in @('githubConsecutiveFail', 'githubProbedAt', 'githubLastOk', 'githubLastError', 'githubLastRecoverAt')) {
+      $m.Groups[1].Value | Should Match $k
+    }
+  }
+}
+
+Describe '日志函数健壮性' {
+  It 'Write-NetEnvLog 在无过期日志时不得抛错（轮转管道不能反噬主流程）' {
+    # 背景：原写法 "... | Remove-Item -Force" 在过滤结果为空时，PowerShell 7 会在参数
+    # 绑定阶段抛 "Remove-Item: missing path operand"（实测 7.6.6）；它不受 -ErrorAction
+    # 抑制、会从日志函数逃出，而日志函数主流程各处都在调，一旦逃出即打断 supervisor-loop。
+    # 5.1 行为不同不抛 —— 正因如此生产日志里看不到，只有换宿主才暴露。
+    { Write-NetEnvLog 'INFO' 'Pester: 日志函数健壮性自检' } | Should Not Throw
   }
 }
 

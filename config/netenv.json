@@ -26,7 +26,16 @@
                    "failThreshold":  2,
                    "autoRefreshOnFail":  true,
                    "autoRefreshMinIntervalMinutes":  30,
-                   "autoFallbackToDirect":  false
+                   "autoFallbackToDirect":  false,
+                   "githubProbe":  {
+                                       "enabled":  true,
+                                       "probeUrls":  [
+                                                         "https://github.com/robots.txt"
+                                                     ],
+                                       "failThreshold":  2,
+                                       "group":  "github-adaptive",
+                                       "recoverMinIntervalMinutes":  10
+                                   }
                },
     "sensitiveDomains":  [
                              "*.163.com/mail",
