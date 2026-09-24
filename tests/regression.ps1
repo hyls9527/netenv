@@ -43,6 +43,8 @@ if ($Live) {
 
 Import-Module Pester
 $testPath = Join-Path $PSScriptRoot 'netenv.tests.ps1'
+# 日志沙箱在用例文件内部（dot-source core.ps1 之后立即生效）—— 这里再做会在
+# dot-source 时被 core.ps1 的 $script:NetEnvRoot 重新覆盖掉，实测无效。
 $allOk = $true
 foreach ($round in 1..3) {
   $r = Invoke-Pester -Path $testPath -PassThru

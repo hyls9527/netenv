@@ -6,6 +6,15 @@ $root = Split-Path -Parent $here
 . "$root\lib\nodes.ps1"
 . "$root\lib\secrets.ps1"
 
+# ---- 日志沙箱：只把"写日志"这一件事重定向到临时目录，不动 $script:NetEnvRoot ----
+# 为什么不能直接改 root：大量用例要读仓库真实 config/data（默认配置校验、端口派生、订阅合并），
+# 改 root 会把这些读操作一起指向空目录 —— 实测一次改出 8 条失败。
+# 为什么要沙箱：用例里的故障注入（坏配置、错误端口、不存在的组、临时 install 目录）都会经
+# Write-NetEnvLog 落盘，于是"跑一轮回归 = 生产 logs/<日期>.log 里多几十条看着像真故障的 WARN"——
+# 实测一次会话跑几十轮，当天日志从 650 字节涨到 22 KB、其中 217 行是测试噪声，真事故被淹。
+$script:NetEnvLogDirOverride = Join-Path $env:TEMP ('netenv-tests-logs-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $script:NetEnvLogDirOverride -Force | Out-Null
+
 Describe 'NetEnv 配置' {
   It '默认配置可解析且端口无重复' {
     $cfg = Read-NetEnvConfig
@@ -395,6 +404,44 @@ Describe '自愈链完整性' {
     $core = Read-NetEnvFileText (Join-Path $root 'lib\core.ps1')
     $core | Should Match 'function Update-NetEnvMihomoConfig'
     $core | Should Match '/configs\?force=true'
+  }
+  It '失败计数必须在降级动作后归零（否则日志永远打"第 N/2 次"，N 一路爬）' {
+    # 背景：consecutiveFail 记在 health-state.json 里，触发降级后若不归零，它就一直爬 ——
+    # 实测 logs/20260915.log 全天刷"出品探针失败（第 11/2 次）"这类自相矛盾的日志，
+    # 把"降级链空转"这条真故障淹在里面。归零后 N 只表示本轮第几次，退避交给 lastRefreshAt。
+    # 两条链（出品、github）都必须有这个归零点；github 链在复测成功分支，故只断言出品链。
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $m = [regex]::Match($loop, '(?m)^        \$st\.consecutiveFail = 0\s*$')
+    $m.Success | Should Be $true
+    # 顺序守卫：二级降级的判据与一级同源（同一个 consecutiveFail），归零若排在它前面，
+    # autoFallbackToDirect=true 的"回退直连"就永不触发（静默失效，正是本文件最怕的坑）
+    $lvl2 = $loop.IndexOf('二级降级')
+    $lvl2 | Should BeGreaterThan 0
+    $m.Index | Should BeGreaterThan $lvl2
+    # 退避跳过是正常状态，不得记 WARN 刷屏
+    $loop | Should Match "Write-NetEnvLog 'INFO' `"出品不可用，但距上次自动刷新仅"
+  }
+
+  It '归零语句的落点与幂等性（结构守卫，非行为测试）' {
+    # 为什么不写成"真跑一遍循环体"的行为测试（试过，代价太大，留档免得后人重复踩）：
+    #   1) 循环体依赖 while 之前赋值的 $healthFile / $lastProbe，只抽循环体就要连前置行一起注入，
+    #      任何一处漏掉都表现为"探针一次都不跑、refresh=0"，指标全绿但其实是空跑；
+    #   2) 桩要装在脚本作用域才拦得住 core.ps1 的真身：Pester 3.4 的 It 块跑在模块作用域，
+    #      本会话 Set-Item function: 装的桩根本命中不了目标函数；
+    #   3) 曾因截取少一个大括号导致 Invoke-Expression 解析失败后死循环，把整轮 Pester 挂满 10 分钟。
+    # 三条都真踩过，净收益是负的。真正的行为验证放在生产侧：logs/ 里再出现"第 N/2 次"且 N>2 即回归。
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    # 结构：缩进 8 空格的归零语句必须存在（就在降级分支收尾处）
+    $m = [regex]::Match($loop, '(?m)^        \$st\.consecutiveFail = 0\s*$')
+    $m.Success | Should Be $true
+    # 顺序：必须在"二级降级"之后，否则 autoFallbackToDirect=true 的回退永不触发（静默失效）
+    $lvl2 = $loop.IndexOf('二级降级')
+    $lvl2 | Should BeGreaterThan 0
+    $m.Index | Should BeGreaterThan $lvl2
+    # 幂等性：该缩进层级只允许出现一处，多了说明归零被挪进了分支内部（退避跳过分支就归不了零）
+    @([regex]::Matches($loop, '(?m)^        \$st\.consecutiveFail = 0\s*$')).Count | Should Be 1
+    # 退避跳过是正常状态，不得记 WARN 刷屏
+    $loop | Should Match "Write-NetEnvLog 'INFO' `"出品不可用，但距上次自动刷新仅"
   }
 }
 
