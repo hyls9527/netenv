@@ -30,12 +30,75 @@ function Invoke-NetEnvDoctor {
   }
 
   # 系统代理（仅 WinINET；WinHTTP 只记录）
-  $ie = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
-  $proxyHostPort = (Get-NetEnvProxyUrl $cfg) -replace '^https?://', ''
-  $proxyOk = -not $ie.ProxyEnable -or ($ie.ProxyServer -like "*$proxyHostPort*")
-  Add-Check 'sysproxy' '系统代理(WinINET)' $proxyOk "ProxyEnable=$($ie.ProxyEnable); ProxyServer=$($ie.ProxyServer)"
+  # 判据从"含 7897 即通过"收紧为"与配置期望值完全相等"：前者在第三方客户端把端口写成
+  # 别名、写多一条、或只启用却不设 ProxyServer 时都会误判通过。实际状态与期望值的比对
+  # 统一走 core.ps1 的 Get-NetEnvSystemProxyState，与自愈循环同源。
+  # 分支依据必须是 Intent（持久化意图标记）而非"期望值是否为空"：后者在"proxy 档但系统代理
+  # 已被清空"时会落进"期望关闭"分支，把故障判成 OK —— 正是本工具要抓的那种"绿着坏"。
+  $sps = Get-NetEnvSystemProxyState -Cfg $cfg
+  if ($sps.Intent -eq 'proxy') {
+    $proxyOk = ($sps.Enabled -and $sps.Server -eq $sps.ExpectedServer)
+    $proxyDetail = "ProxyEnable=$($sps.Enabled); ProxyServer='$($sps.Server)'$(if ($proxyOk) { '' } else { "（期望 '$($sps.ExpectedServer)'；疑似 VPN/其他代理客户端接管，supervisor-loop 会自动重写）" })"
+  } else {
+    # direct / github 档：本档不接管系统代理，残留才是故障
+    $proxyOk = -not $sps.Enabled
+    $proxyDetail = "ProxyEnable=$($sps.Enabled); ProxyServer='$($sps.Server)'（档位 $($sps.Intent) 不使用系统代理）"
+  }
+  Add-Check 'sysproxy' '系统代理(WinINET)' $proxyOk $proxyDetail
+
+  # 代理绕过清单：<local> 与私网段必须在，否则 localhost、局域网与本机服务（含 mihomo
+  # 自身与 DSH Web）都会被塞进代理。客户端接管系统代理时常顺手写一份自己的清单，此检查用于兜底。
+  if ($sps.Intent -eq 'proxy' -and $sps.Enabled) {
+    $missingBypass = @(@('<local>', '127.*', '192.168.*') | Where-Object { $sps.Override -notlike "*$_*" })
+    Add-Check 'proxybypass' '代理绕过清单' ($missingBypass.Count -eq 0) $(if ($missingBypass.Count) { "缺少: $($missingBypass -join ', ')" } else { '含 <local> 与私网段' })
+  } else {
+    Add-Check 'proxybypass' '代理绕过清单' $true '未启用系统代理，跳过'
+  }
+
   $winhttp = (netsh winhttp show proxy 2>$null | Select-String 'Direct access' | Measure-Object).Count
   Add-Check 'winhttp' 'WinHTTP(仅记录)' $true ("状态: $(if ($winhttp -gt 0) {'直连'} else {'非直连'})")
+
+  # VPN 类接管检测（记录项）：VPN 客户端一旦连接，会装上接管全部流量的虚拟网卡并加一条
+  # 0.0.0.0/0 路由。此时去往 127.0.0.1:7897 的连接仍可能连通，于是上面的出品探针报绿、
+  # health-state.json 一路 lastOk，而流量其实根本没走 mihomo 规则（敏感域名直连清单与
+  # github 自适应分流静默失效）—— 即"绿着坏"。这种状态端口与探针都发现不了，只能直接看网络状态。
+  $vpnAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+    $_.Status -eq 'Up' -and ("$($_.Name) $($_.InterfaceDescription)" -match 'TUN|TAP|WireGuard|OpenVPN|VPN|Proton|Wintun')
+  })
+  $vpnRoutes = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+  $vpnTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+    $_.TaskName -match 'vpn|wireguard|openvpn|clash|mihomo|proxy' -and $_.State -ne 'Disabled'
+  })
+  # 三条独立证据：虚拟网卡已连接 / 存在多条默认路由 / 有 VPN 类计划任务在启用状态
+  $vpnSignals = @()
+  if ($vpnAdapters.Count) { $vpnSignals += ("适配器: " + (($vpnAdapters | ForEach-Object { "$($_.Name)($($_.InterfaceDescription))" }) -join ', ')) }
+  if ($vpnRoutes.Count -gt 1) { $vpnSignals += "默认路由 $($vpnRoutes.Count) 条（多默认路由=流量被接管）" }
+  if ($vpnTasks.Count) { $vpnSignals += ("计划任务: " + (($vpnTasks | ForEach-Object { $_.TaskName }) -join ', ')) }
+  Add-Check 'vpntakeover' 'VPN 类接管（仅提示）' $true $(if ($vpnSignals.Count) { ($vpnSignals -join '；') + ' —— 与 mihomo 并存会互相改写系统代理/路由，详见 docs/TROUBLESHOOTING.md' } else { '未发现' })
+
+  # 第三方 VPN 类自启项（记录项）：自启的 VPN 客户端会在登录后自动连接并接管系统代理，
+  # 是"昨天还好、今天开机就全废"的常见成因。命中不判失败 —— 是否保留由用户决定。
+  # 只扫 Run 键与启动文件夹；不做进程级匹配（NetEnv 自身也在跑 mihomo，误报率太高）。
+  $vpnRunHits = @(foreach ($runKey in @(
+      'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+      'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+      'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run')) {
+    $item = Get-ItemProperty -Path $runKey -ErrorAction SilentlyContinue
+    if ($item) {
+      foreach ($prop in $item.PSObject.Properties) {
+        if ($prop.Name -like 'PS*') { continue }
+        if ("$($prop.Name) $($prop.Value)" -match 'vpn|wireguard|openvpn|shadowsocks|trojan|sing-box|v2ray|xray') {
+          "$($prop.Name) = $($prop.Value)"
+        }
+      }
+    }
+  })
+  $startupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+  $vpnStartupHits = @(Get-ChildItem -LiteralPath $startupDir -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match 'vpn|wireguard|openvpn|clash|mihomo|proxy|shadow|trojan' } |
+    ForEach-Object { $_.Name })
+  $vpnAutoAll = @($vpnRunHits) + @($vpnStartupHits)
+  Add-Check 'vpnautorun' 'VPN 类自启项（仅提示）' $true $(if ($vpnAutoAll.Count) { ($vpnAutoAll -join ' | ') } else { '无' })
 
   # 环境变量：判据必须与档位一致 —— proxy 档（envProxy=true）下这组变量是预期配置，
   # 只有 direct/github 档（envProxy=false）才把它们当"残留"。

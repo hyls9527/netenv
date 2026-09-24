@@ -68,6 +68,11 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   - **为什么恢复动作不是刷订阅**：`github-adaptive` 组是 `lazy: true`（没流量就不测速），一旦某轮被判定
     `alive:false` 就再没有流量进来、也就永远不再测速，坏状态被**冻结**；而组内节点其实健康
     （同一次测速实测 `github-node` 595ms / `proxy-select` 686ms）。触发一次组测速即恢复，代价远低于刷订阅。
+- **系统代理漂移自愈**：`supervisor-loop` 每轮比对 WinINET 实际值与当前档位期望值并重写（5 分钟退避）。
+  必要性：第三方 VPN / 代理客户端连接时会接管系统代理，而**进程探活与出品探针都发现不了** ——
+  端口照样 LISTEN、经隧道探针照样通，吃系统代理的程序却已全部退回直连（典型的"全绿着坏"）。
+  判据与 `doctor` 共用 `Get-NetEnvSystemProxyState`；`doctor` 另有 `代理绕过清单`、`VPN 类接管`、
+  `VPN 类自启项` 三项，专治 TUN 接管下的探针假阳性（见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)）。
 - **降级链**：探针连续失败达 `health.failThreshold` → 触发 `nodes refresh`（自带"失败保留旧配置"）
   → **经控制器 `PUT /configs?force=true` 重载 mihomo**（刷新只改 `data/merged.yaml`；运行中的 mihomo 不会自己读新配置，
   不重载则刷新出的节点永远不生效）→ 仍不可用且 `health.autoFallbackToDirect` 为真时回退 `apply -profile direct`。

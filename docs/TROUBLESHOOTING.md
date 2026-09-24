@@ -65,6 +65,27 @@
   7-Zip 用 `a -t7z -p<pw> -mhe=on`；Bandizip 用 `a -fmt:7z -p:<pw>`（其 7z 加密头默认开启，实测无密码无法列出条目名）。
 - **代理端口在听但打不开网页**：先跑 `netenv doctor`，看 `端到端出品（经代理实测）` 这一项。
   它走真实请求，能区分"进程活着"与"出口可用"；`data/health-state.json` 记录连续失败次数。
+- **装了第三方 VPN（Proton VPN / WireGuard / 其他代理客户端）后，某天开机代理全废**：
+  与 mihomo **不是端口冲突，而是抢夺同一层网络状态**。三条已验证的互斥通道：
+  1. **系统代理**：VPN 客户端连接/断开时接管 WinINET 的 `ProxyEnable/ProxyServer`，谁最后写谁赢。
+     症状是吃系统代理与 `HTTP_PROXY` 的程序全部退回直连，而 mihomo 端口照样 LISTEN。
+     现在 `supervisor-loop` 每轮比对实际值与配置期望值并自动重写（5 分钟退避），
+     `doctor` 的 `系统代理(WinINET)` 会给出实际值与期望值的差异。
+  2. **Kill Switch / 泄漏保护的 WFP 拦截**：VPN 会拦掉"非隧道"流量，包括去往 `127.0.0.1:7897`
+     的连接与 mihomo 的出站。此时端口仍 LISTEN 但出品探针全红；退出 VPN 请走客户端自己的
+     退出（勿 `Stop-Process` 强杀 —— 带 WFP callout 的进程被强杀可能留下未回收的过滤规则，
+     表现为整机断网）。
+  3. **TUN 默认路由劫持（"绿着坏"）**：VPN 装上 TUN 网卡并加 `0.0.0.0/0` 路由后，经
+     `127.0.0.1:7897` 的探针**仍然能通**，于是 `doctor` 报绿、`health-state.json` 一路 `lastOk`，
+     而流量根本没走 mihomo 规则 —— `sensitiveDomains` 直连清单与 github 自适应分流静默失效。
+     端口与探针都发现不了，因此另有独立检测项：`VPN 类接管`（看是否有已连接的 VPN 类适配器、
+     是否存在多条默认路由）与 `VPN 类自启项`（看 Run 键/启动文件夹里的 VPN 客户端，这类自启
+     会在登录后自动连接并接管）。**判据是"多默认路由"而不是"有 VPN 适配器"** —— 多出口确实
+     能分流，单出口接管才是问题。
+  - 处置**顺序**：① 退出 VPN 客户端并由其恢复网络设置 → ② `netenv doctor` 复核
+    `系统代理(WinINET)` 与 `端到端出品` → ③ 若必须两者并存，**不要让两者抢同一层**：
+    首选把 VPN 的 WireGuard 配置导入 mihomo 做上游（系统代理只由 mihomo 持有），
+    次选让 VPN 走 TUN 并把 NetEnv 切到 `apply -profile direct`，二选一而非并存。
 - **`SEC_E_CERT_EXPIRED` / `schannel: failed to receive handshake` / `SSL routines::unexpected eof`**：
   免费出口节点呈现的证书无效或会话被中断。诊断要点（实测得出）：
   - `curl -k`（跳过校验）若返回正常状态码 → **隧道是通的，问题在证书**，不是网络封禁；

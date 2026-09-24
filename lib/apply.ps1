@@ -69,13 +69,7 @@ function Invoke-NetEnvApply {
   "profile=$Profile 已应用。快照: $snapFile`n提示：已运行的程序需重启才会读取新的环境变量。"
 }
 
-function Set-NetEnvProxyReg {
-  param([int]$Enable, [string]$Server, [string]$Override)
-  $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-  Set-ItemProperty -Path $path -Name ProxyEnable -Value $Enable
-  Set-ItemProperty -Path $path -Name ProxyServer -Value $Server
-  Set-ItemProperty -Path $path -Name ProxyOverride -Value $Override
-}
+# Set-NetEnvProxyReg 已上移到 core.ps1（自愈循环需要在不加载本文件时也能修系统代理）。
 
 function Set-NetEnvGitProxy {
   param([string]$Proxy)

@@ -34,6 +34,81 @@ function Get-NetEnvProxyUrl {
   return "http://127.0.0.1:$port"
 }
 
+function Set-NetEnvProxyReg {
+  # 系统代理（WinINET）的唯一写入点。原定义在 apply.ps1，但自愈循环必须能在不加载
+  # apply.ps1 的前提下修复系统代理漂移，故上移到 core.ps1（apply.ps1 已 dot-source 本文件，
+  # 调用点无需改动）。两处各留一份必然漂移 —— 与本仓库"判据只写一份"的既有约定一致。
+  param([int]$Enable, [string]$Server, [string]$Override)
+  $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+  Set-ItemProperty -Path $path -Name ProxyEnable -Value $Enable
+  Set-ItemProperty -Path $path -Name ProxyServer -Value $Server
+  Set-ItemProperty -Path $path -Name ProxyOverride -Value $Override
+}
+
+# 期望开启系统代理 = 从**持久化意图标记**推断档位，而不是用 Get-NetEnvActiveProfile。
+# 为什么不能复用：后者把 ProxyEnable=1 当作"当前是 proxy 档"的依据，于是
+#   ① VPN 把 ProxyEnable 清成 0 时（最常见的接管形态）它推断成 direct 档，
+#      自愈逻辑便认为"本档期望就是关闭"，漂移永远检不出来 —— 实测真实缺陷；
+#   ② 依赖被观测对象本身来自证身份，是循环论证。
+# 意图标记由 apply 写入且与档位同生共死（envProxy -> HTTP_PROXY / NODE_USE_ENV_PROXY，
+# 各档 -> git http.proxy），不受 VPN 篡改注册表的影响。
+function Get-NetEnvProxyIntent {
+  $cfg = Read-NetEnvConfig -Quiet
+  if (-not $cfg -or -not $cfg.profiles) { return $null }
+  $wantUrl = (Get-NetEnvProxyUrl $cfg)
+  $userHttp = [Environment]::GetEnvironmentVariable('HTTP_PROXY', 'User')
+  $userNode = [Environment]::GetEnvironmentVariable('NODE_USE_ENV_PROXY', 'User')
+  if ($userHttp -and ($userHttp -eq $wantUrl) -and $userNode -eq '1') { return 'proxy' }
+  $gitProxy = (git config --global --get http.proxy 2>$null)
+  if ($gitProxy -and ($gitProxy -eq $wantUrl)) { return 'github' }
+  return 'direct'
+}
+
+# 读取系统代理实际状态并与配置期望值比对，供 doctor 与自愈循环共用（判据只写一份）。
+# 为什么必须把它当回事：第三方 VPN / 代理客户端在连接与断开时会接管 WinINET 的
+# ProxyEnable/ProxyServer，且"谁最后写谁赢"。一旦被改写，吃系统代理与 HTTP_PROXY 的
+# 程序会直接退回直连（被墙目标全废），而 supervisor-loop 原本只做进程探活与出品探针，
+# 没有任何一处重写系统代理 —— 这个错会一直挂到人工 apply 为止。
+function Get-NetEnvSystemProxyState {
+  param($Cfg)
+  if (-not $Cfg) { $Cfg = Read-NetEnvConfig -Quiet }
+  $path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+  $ie = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+  $enabled = [bool]$ie.ProxyEnable
+  $server = [string]$ie.ProxyServer
+  $expectedServer = $null
+  $expectedOverride = $null
+  $intent = $null
+  if ($Cfg -and $Cfg.profiles) {
+    $intent = Get-NetEnvProxyIntent
+    if ($intent -and ($Cfg.profiles.PSObject.Properties.Name -contains $intent)) { $intentCfg = $Cfg.profiles.$intent } else { $intentCfg = $null }
+  } else { $intentCfg = $null }
+  if ($intentCfg -and $intentCfg.systemProxy) {
+    $hostPort = (Get-NetEnvProxyUrl $Cfg) -replace '^https?://', ''
+    $expectedServer = "http=$hostPort;https=$hostPort"
+    $expectedOverride = ($Cfg.noProxy -join ';')
+  }
+  # Drifted 只在"期望开启系统代理"时有意义：direct/github 档期望就是关闭，
+  # 此时 ProxyEnable=0 属正常，不得据此自愈（否则会跟人工切档互相打架）。
+  # 判据必须同时覆盖"被改写"与"被清空"两种写法 —— 客户端接管有两种常见形态：
+  #   ① 改成自己的地址（ProxyEnable=1 但 ProxyServer 变了）；
+  #   ② 直接关掉/清空（ProxyEnable=0，ProxyServer 可能还留着旧串）。
+  # 只判 ① 会漏掉 ②，而 ② 恰恰是"连接时接管、断开时不留"的最常见形态。
+  # 注意 ProxyOverride 不参与判定：本机实测它天然就与配置不一致（历史遗留条目），
+  # 拿它当判据会让修复永不收敛、每轮都误判"仍在漂移"。
+  $drifted = $false
+  if ($expectedServer) { $drifted = (-not $enabled) -or ($server -ne $expectedServer) }
+  return [PSCustomObject]@{
+    Enabled          = $enabled
+    Server           = $server
+    Override         = [string]$ie.ProxyOverride
+    ExpectedServer   = $expectedServer
+    ExpectedOverride = $expectedOverride
+    Intent           = $intent
+    Drifted          = $drifted
+  }
+}
+
 # 当前生效档位需从三处实际状态推断：系统代理 / git 代理 / 用户环境变量。
 # 只认 ProxyEnable 会把 github 档（只注入 git 代理）误报成 direct（见 status.ps1 历史注释）。
 # doctor 与 status 共用本函数，避免两处判据各写一份而漂移。
@@ -123,7 +198,11 @@ function ConvertTo-Redacted {
 function Write-NetEnvLog {
   param([string]$Level = 'INFO', [string]$Message)
   $paths = Get-NetEnvPaths
+  # 日志目录可被覆盖（回归测试用）：用例会注入坏配置 / 错误端口 / 不存在的组，
+  # 不重定向就会把一堆"看着像真故障"的 WARN 写进生产 logs/<日期>.log，把真事故淹掉
+  # （实测一次会话跑几十轮，当天日志 650 字节 → 22 KB，217 行是测试噪声）。
   $logDir = $paths.Logs
+  if ($script:NetEnvLogDirOverride) { $logDir = $script:NetEnvLogDirOverride }
   if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
   $logFile = Join-Path $logDir "$(Get-Date -Format 'yyyyMMdd').log"
   $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, (ConvertTo-Redacted $Message)

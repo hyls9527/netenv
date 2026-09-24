@@ -62,6 +62,14 @@ if ($githubRecoverMinInterval -lt 0) { $githubRecoverMinInterval = 0 }
 $controllerPort = 19090
 if ($cfg.ports -and $cfg.ports.mihomoController) { $controllerPort = [int]$cfg.ports.mihomoController }
 $mergedFile = Join-Path $paths.Data 'merged.yaml'
+
+# 系统代理漂移自愈参数。为什么放在自愈循环里：进程探活与出品探针都发现不了这件事 ——
+# 第三方 VPN / 代理客户端接管 WinINET 后，mihomo 端口照样 LISTEN、探针经隧道也照样通，
+# 而吃系统代理与 HTTP_PROXY 的程序已经全部退回直连（银行/邮箱等直连清单与 github 分流失效）。
+# 这是典型的"全绿着坏"，只能在状态层直接比对并修复。
+$proxyRepairMinInterval = 5
+$lastProxyRepair = (Get-Date).AddMinutes(-$proxyRepairMinInterval - 1)
+
 Write-NetEnvLog 'INFO' "supervisor-loop: 启动，进程探活 $interval 分钟 / 出品探针 $probeInterval 分钟 / 目标 $($probeUrls -join ' | ')"
 if ($githubProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: github 专项探针 启用 / 目标 $($githubProbeUrls -join ' | ') / 连败 $githubFailThreshold 次触发 $githubGroup 组测速" }
 
@@ -70,6 +78,25 @@ $lastProbe = (Get-Date).AddMinutes(-$probeInterval - 1)
 
 while ($true) {
   try { & "$PSScriptRoot\supervisor.ps1" } catch { Write-NetEnvLog 'ERROR' "supervisor-loop: 单轮异常 $_" }
+
+  # ---- 系统代理漂移自愈（每轮都查，与出品探针的 5 分钟周期无关）----
+  # 只在"当前档位期望开启系统代理"时才动手：direct/github 档下 ProxyEnable=0 是预期状态，
+  # 修它等于跟人工切档打架。Get-NetEnvSystemProxyState 内部已按档位算出 Drifted。
+  try {
+    $sps = Get-NetEnvSystemProxyState -Cfg $cfg
+    if ($sps.Drifted) {
+      if (((Get-Date) - $lastProxyRepair).TotalMinutes -ge $proxyRepairMinInterval) {
+        Write-NetEnvLog 'WARN' ("系统代理被改写（实际 ProxyEnable=$($sps.Enabled) / ProxyServer='$($sps.Server)'；" +
+          "期望 '$($sps.ExpectedServer)'）→ 疑似 VPN/其他代理客户端接管，已按当前档位重写")
+        Set-NetEnvProxyReg 1 $sps.ExpectedServer $sps.ExpectedOverride
+        $lastProxyRepair = Get-Date
+      } else {
+        # 退避不是故障：对方每轮都改的情况下，没有这个下限就会每 1 分钟重写并刷一条 WARN，
+        # 把真故障淹掉（与 lastRefreshAt / githubLastRecoverAt 同一口径）。
+        Write-NetEnvLog 'INFO' "系统代理仍被改写，距上次修复不足 $proxyRepairMinInterval 分钟，本轮跳过"
+      }
+    }
+  } catch { Write-NetEnvLog 'WARN' "系统代理漂移检查异常：$_" }
 
   if (((Get-Date) - $lastProbe).TotalMinutes -ge $probeInterval) {
     $lastProbe = Get-Date
@@ -102,6 +129,10 @@ while ($true) {
 
       if ([int]$st.consecutiveFail -ge $failThreshold) {
         # 一级降级：刷新免费节点（付费源不动）。nodes refresh 自带"失败保留旧配置"保护。
+        # 计数在降级动作结束后归零（含退避跳过与 autoRefresh 关闭两种情况），否则它顺着
+        # health-state.json 一直爬，产出"出品探针失败（第 17/2 次）"这种自相矛盾日志
+        # （实测 logs/20260915.log 全天如此，把真故障淹了）。退避职责归 lastRefreshAt，
+        # 与 github 专项链在恢复动作后置 0 的口径一致。
         if ($autoRefresh) {
           # 最小刷新间隔：否则探针目标长期不可达时每轮都去锤订阅源（实测每 5 分钟一次，
           # 20 轮下来订阅源被反复下载）。记账落在 health-state.json，进程重启也不丢。
@@ -111,7 +142,10 @@ while ($true) {
           }
           if ($lastRefresh -and ((Get-Date) - $lastRefresh).TotalMinutes -lt $refreshMinInterval) {
             $agoMin = [int]((Get-Date) - $lastRefresh).TotalMinutes
-            Write-NetEnvLog 'WARN' "出品不可用，但距上次自动刷新仅 $agoMin 分钟（下限 $refreshMinInterval 分钟），本轮跳过"
+            # 退避跳过不是故障、更不是待办动作（刷新已记在案并会自动重试），刻意用 INFO 且不记 WARN：
+            # 若记 WARN，一旦订阅源长期不可达就会每 5 分钟刷一条"本轮跳过"，把真故障淹掉
+            # （当年 consecutiveFail 一路爬升的刷屏就是这么来的）。
+            Write-NetEnvLog 'INFO' "出品不可用，但距上次自动刷新仅 $agoMin 分钟（下限 $refreshMinInterval 分钟），本轮跳过"
           } else {
             Write-NetEnvLog 'WARN' '出品不可用 → 触发 nodes refresh'
             # 先记账再动手：刷新自身抛错时同样要退避，否则每轮都重试
@@ -145,6 +179,10 @@ while ($true) {
             $st.lastError = ("$($st.lastError) | 已回退 direct")
           } catch { Write-NetEnvLog 'ERROR' "回退 direct 失败：$_" }
         }
+
+        # 计数归零必须放在两条降级链的**最后**：二级降级的判据与一级同源（consecutiveFail），
+        # 提前归零会让 autoFallbackToDirect=true 的回退永不触发。
+        $st.consecutiveFail = 0
       }
     }
     # ---- github 专项探针：判据独立，不并入上面的出品 OR ----
