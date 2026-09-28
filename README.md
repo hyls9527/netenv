@@ -100,6 +100,13 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 - 计划任务 `NetEnv-Supervisor`（开机）+ `NetEnv-Supervisor-Periodic`（每 5 分钟）→ `lib\run-supervisor-hidden.vbs` → `lib\supervisor-loop.ps1`：探活并拉起 mihomo / new-api
   - `install --autostart` 需要管理员权限；**两条任务都用 `wscript.exe` 启动 VBS，不依赖 PATH 里的 `pwsh.exe`**（PATH 缺 pwsh 时计划任务会静默失败），且不闪黑窗
   - VBS 内有**单实例守卫**：周期任务只在自愈循环已死时补拉，不会出现两个循环抢重启与日志
+  - ⚠️ **但 CommandLine 匹配靠不住**：计划任务以 `RunLevel=Highest` 启动循环，而非管理员会话
+    读不到高完整性进程的 `Win32_Process.CommandLine`（实测为空），VBS 的 LIKE 守卫因此**看不见它** ——
+    实测 2026-09-24 启动的一个循环与后来的循环并存了 5 天，两边交替写 `health-state.json`，
+    把 github/GPT 的连败计数反复清零、专项探针阈值形同虚设（日志零痕迹）。因此循环自身另有
+    **命名互斥量**单实例守卫（`Local\NetEnv.SupervisorLoop`，与命令行可见性无关），并每轮写
+    `data/loop-heartbeat-<pid>.json` 心跳；`doctor` 的 `自愈循环存活/单实例` 项据此判定
+    「没在跑」与「跑了多个」，陈旧心跳由活着的实例回收。
 - **失败统计只认"已部署"的服务**：二进制不存在的可选服务（new-api/Sub-Store）直接跳过，
   不参与失败计数（否则未部署的 new-api 会让日志每分钟刷一条 ERROR，把真故障淹没）
 - 日志按天轮转、脱敏、UTF-8 编码，保留天数由 `logging.rotateDays`（默认 14）决定，`netenv clean` 用同一口径（`logs/`，不入库）

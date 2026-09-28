@@ -452,6 +452,24 @@ Describe '自愈链完整性' {
     # 退避跳过是正常状态，不得记 WARN 刷屏
     $loop | Should Match "Write-NetEnvLog 'INFO' `"出品不可用，但距上次自动刷新仅"
   }
+
+  It '自愈循环必须有跨完整性的单实例守卫与心跳（CommandLine 匹配看不见 Highest 启动的实例）' {
+    # 背景：计划任务以 RunLevel=Highest 启动循环，非管理员读不到它的 Win32_Process.CommandLine
+    # （实测为空），VBS 的 LIKE 守卫因此看不见它 —— 两个循环并存了 5 天才被发现，
+    # 它们交替写 health-state.json，把连败计数反复清零，专项探针阈值形同虚设。
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $loop | Should Match 'System\.Threading\.Mutex'
+    $loop | Should Match 'Local\\NetEnv\.SupervisorLoop'
+    $loop | Should Match 'if \(\$loopMutex -and -not \$mutexCreated\)'
+    # 心跳必须写在 while 体内、且在调用 supervisor.ps1 之前（过期即代表循环已死）
+    $hbWrite = $loop.IndexOf('Save-NetEnvTextFile -Path $heartbeatFile')
+    $supervise = $loop.IndexOf('& "$PSScriptRoot\supervisor.ps1"')
+    $hbWrite | Should BeGreaterThan 0
+    $supervise | Should BeGreaterThan 0
+    $hbWrite | Should BeLessThan $supervise
+    # doctor 必须有可见的存活/单实例验收项，否则重复循环只会静默发生
+    (Read-NetEnvFileText (Join-Path $root 'lib\doctor.ps1')) | Should Match "Add-Check 'loop'"
+  }
 }
 
 Describe 'github 专项探针' {

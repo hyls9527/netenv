@@ -66,6 +66,17 @@
   7-Zip 用 `a -t7z -p<pw> -mhe=on`；Bandizip 用 `a -fmt:7z -p:<pw>`（其 7z 加密头默认开启，实测无密码无法列出条目名）。
 - **代理端口在听但打不开网页**：先跑 `netenv doctor`，看 `端到端出品（经代理实测）` 这一项。
   它走真实请求，能区分"进程活着"与"出口可用"；`data/health-state.json` 记录连续失败次数。
+- **`doctor` 报 `自愈循环存活/单实例` 失败（0 个或 ≥2 个实例）**：
+  - `0 个`：循环没起来。自启动没装（便携/无管理员）时属预期；否则用
+    `wscript.exe lib\run-supervisor-hidden.vbs` 拉起，或 `install --autostart` 重装计划任务。
+  - `≥2 个`：**重复循环**，最隐蔽的一类故障。计划任务以 `RunLevel=Highest` 启动循环，而非管理员
+    会话读不到高完整性进程的 `Win32_Process.CommandLine`（返回空），`run-supervisor-hidden.vbs`
+    的 LIKE 单实例守卫**看不见它**，于是每个周期任务都可能补拉一个新循环。实测 2026-09-24 起
+    两个循环并存 5 天：它们交替写 `health-state.json`，把 github/GPT 的连败计数**反复清零**，
+    专项探针的阈值永远攒不够，自愈静默失效（日志里毫无痕迹，因为两边都"正常"）。
+    - 诊断：`doctor` 该项会列出实例 PID；也可看 `data\loop-heartbeat-<pid>.json` 的心跳时间。
+    - 处置：`Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'powershell.exe' }` 逐个确认后
+      保留一个、结束其余；新版本循环有命名互斥量守卫，重启后不会再并存。
 - **ChatGPT 提示"地区不支持" / `unsupported_country_region_territory`，而其它网站一切正常**：
   出口节点落在 OpenAI **不支持地区**（免费池里大量香港/澳门节点）。这类故障的特点是**所有连通性判据都是绿的**：
   端口在听、google 204、github 200，连 `chatgpt.com` 的 TLS 握手都成功 —— 封锁发生在**应用层 403**。

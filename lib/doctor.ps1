@@ -206,6 +206,26 @@ function Invoke-NetEnvDoctor {
   $backupNote = if ($backupCount -gt 0) { "备份 $backupCount 份" } else { '尚无配置备份（apply / config edit 会自动生成）' }
   Add-Check 'config' '配置校验与备份' $cfgOk "配置有效；$backupNote"
 
+  # 自愈循环存活与单实例：心跳文件按 PID 区分，过期即视为已死。
+  # 为什么要查"重复"：实测 2026-09-24 起有一个由计划任务以 RunLevel=Highest 启动的循环，
+  # 其 CommandLine 对非管理员不可见，VBS 的单实例守卫看不见它 —— 两个循环交替写
+  # health-state.json，把 github/GPT 的连败计数反复清零，专项探针阈值形同虚设（日志无痕迹）。
+  $loopPids = @()
+  $hbFreshMin = [Math]::Max(5, [int]$cfg.supervisor.intervalMinutes * 3)
+  foreach ($hbFile in (Get-ChildItem -LiteralPath (Get-NetEnvPaths).Data -Filter 'loop-heartbeat-*.json' -ErrorAction SilentlyContinue)) {
+    try {
+      $hb = (Read-NetEnvFileText $hbFile.FullName) | ConvertFrom-Json
+      if ($hb.at -and ((Get-Date) - [datetime]$hb.at).TotalMinutes -le $hbFreshMin) { $loopPids += [int]$hb.pid }
+    } catch { }
+  }
+  Add-Check 'loop' '自愈循环存活/单实例' ($loopPids.Count -eq 1) $(if ($loopPids.Count -eq 1) {
+    "1 个实例在跑（PID $($loopPids[0])）"
+  } elseif ($loopPids.Count -eq 0) {
+    "自愈循环未在运行（心跳缺失或过期；未安装自启动时如此，见 docs\TROUBLESHOOTING.md）"
+  } else {
+    "发现 $($loopPids.Count) 个循环实例（PID $(($loopPids -join ', '))）—— 会交替写 health-state.json，使专项探针连败阈值失效"
+  })
+
   # .ps1 必须带 UTF-8 BOM：无 BOM 时 Windows PowerShell 5.1 按 ANSI/GBK 解码，
   # 中文注释会破坏引号配对并导致 ParseException（实测高频故障）
   $noBom = (New-Object System.Collections.Generic.List[string])

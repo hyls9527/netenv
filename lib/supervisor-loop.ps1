@@ -6,6 +6,26 @@ $ErrorActionPreference = 'Continue'
 # 自愈链第一级从未真正生效（logs/20260917.log 实测连续 20 轮）。回归测试有静态守卫。
 . "$PSScriptRoot\nodes.ps1"
 
+# ---- 单实例守卫（命名互斥量）----
+# 为什么不能只靠 lib\run-supervisor-hidden.vbs 的 CommandLine 匹配：计划任务以 RunLevel=Highest
+# 启动循环，而非管理员会话读不到**高完整性进程**的 CommandLine（实测 Win32_Process.CommandLine
+# 返回空），VBS 的 LIKE 匹配因此看不见它 —— 于是两个循环并存。实测 2026-09-24 启动的实例一直
+# 跑到 2026-09-29 才被发现：两边交替写 health-state.json，把 github/GPT 的连败计数反复清零，
+# 专项探针阈值形同虚设（这类故障日志里没有任何痕迹，比崩溃更难发现）。
+# 互斥量与命令行可见性无关，是唯一可靠的判据；进程退出时由操作系统自动释放。
+$mutexCreated = $false
+$loopMutex = $null
+try {
+  $loopMutex = New-Object System.Threading.Mutex($false, 'Local\NetEnv.SupervisorLoop', [ref]$mutexCreated)
+} catch {
+  # 创建失败不能拒绝启动：那会让自愈链整体静默失效（比重复循环更糟），只记 WARN 继续
+  Write-NetEnvLog 'WARN' "supervisor-loop: 单实例互斥量创建失败，继续启动（$($_.Exception.Message)）"
+}
+if ($loopMutex -and -not $mutexCreated) {
+  Write-NetEnvLog 'INFO' 'supervisor-loop: 已有实例在运行，本实例退出（单实例守卫）'
+  exit 0
+}
+
 # 出品探针判据见 core.ps1 的 Test-NetEnvEgressAny：多目标 OR —— 任一目标可达即视为出品可用。
 # doctor 与自愈循环共用同一函数，避免"doctor 说不可用、循环说可用"两套口径。
 # 单目标（旧实现只认 health.probeUrl）会把"这一个目标被墙/节点不通"直接判成整机出品不可用：
@@ -105,9 +125,32 @@ if ($githubProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: github 专项探�
 if ($gptProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: GPT 专项探针 启用 / 目标 $($gptProbeUrls -join ' | ') / 连败 $gptFailThreshold 次触发 $gptRotateGroup 节点轮换（地区判据）" }
 
 $healthFile = Join-Path $paths.Data 'health-state.json'
+# 心跳文件：每实例一个（按 PID），供 doctor 发现"循环没起来"与"重复循环"。
+# 互斥量负责预防，心跳负责发现 —— 跨完整性下万一互斥量失效，也不至于再瞎 5 天才发现。
+$heartbeatFile = Join-Path $paths.Data ("loop-heartbeat-$PID.json")
+$loopStartedAt = (Get-Date -Format 's')
 $lastProbe = (Get-Date).AddMinutes(-$probeInterval - 1)
 
+# 探针状态的**常驻**哈希表（在 while 之外初始化，不随每轮重建）。
+# 键必须齐全：加载只遍历本表的键，漏掉的键读不到已存值、每轮都被重置。
+# 为什么必须常驻而不是每轮重建（两条都是实测）：
+#   ① 与当年 lastRefreshAt 退避失效同一类坑 —— 键漏了就被打回默认值；
+#   ② 存在"另一个循环实例交替写 health-state.json"的情形（高完整性实例躲过 CommandLine 守卫，
+#      2026-09-24～29 实测）—— 对方写出的文件里没有新键，每轮重建会把 github/GPT 连败计数
+#      打回 0，专项探针阈值永远攒不够。常驻内存后，文件里**缺失**的键不再覆盖内存值。
+$st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null; lastRefreshAt = $null; githubConsecutiveFail = 0; githubLastOk = $null; githubLastError = $null; githubProbedAt = $null; githubLastRecoverAt = $null; gptConsecutiveFail = 0; gptLastOk = $null; gptLastError = $null; gptProbedAt = $null; gptLastRecoverAt = $null }
+
 while ($true) {
+  # 心跳 + 清理陈旧心跳（3 倍轮询周期）。必须在 supervisor.ps1 之前写：
+  # 心跳过期即代表"循环已死"，doctor 据此判定，陈旧文件由活着的实例负责回收。
+  try {
+    Save-NetEnvTextFile -Path $heartbeatFile -Content ([ordered]@{ pid = $PID; at = (Get-Date -Format 's'); startedAt = $loopStartedAt } | ConvertTo-Json)
+    $hbCutoff = (Get-Date).AddMinutes(-1 * ([Math]::Max(5, $interval * 3)))
+    Get-ChildItem -LiteralPath $paths.Data -Filter 'loop-heartbeat-*.json' -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -lt $hbCutoff } |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  } catch { }
+
   try { & "$PSScriptRoot\supervisor.ps1" } catch { Write-NetEnvLog 'ERROR' "supervisor-loop: 单轮异常 $_" }
 
   # ---- GPT 已验证节点的重放（每轮都查，独立于 5 分钟的探针周期）----
@@ -154,9 +197,6 @@ while ($true) {
 
   if (((Get-Date) - $lastProbe).TotalMinutes -ge $probeInterval) {
     $lastProbe = Get-Date
-    # 键必须齐全：下面的加载只遍历本哈希表的默认键，漏掉的键读不到已存值、每轮都被重置
-    # （与当年 lastRefreshAt 退避失效同一类坑）。
-    $st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null; lastRefreshAt = $null; githubConsecutiveFail = 0; githubLastOk = $null; githubLastError = $null; githubProbedAt = $null; githubLastRecoverAt = $null; gptConsecutiveFail = 0; gptLastOk = $null; gptLastError = $null; gptProbedAt = $null; gptLastRecoverAt = $null }
     if (Test-Path -LiteralPath $healthFile) {
       try {
         $loaded = (Read-NetEnvFileText $healthFile) | ConvertFrom-Json
