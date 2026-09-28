@@ -536,6 +536,40 @@ Describe '运行时脚本编码' {
   }
 }
 
+Describe '浏览器代理修复脚本' {
+  # 背景：该脚本是会话产物，初版写死了代理端口与用户目录、还丢了 BOM —— 与仓库三条底线
+  # （端口只从端口表派生 / 路径通用化 / .ps1 必带 BOM）同时冲突，且它一度是 doctor 与回归
+  # 唯一的失败项。以下守卫是结构性的，目的是防止再次漂移，不是行为测试。
+  It '5.1 解析器零错误，且不写死代理端口（端口一律从端口表派生）' {
+    $p = Join-Path $root 'fix-browser-proxy.ps1'
+    (Test-Path -LiteralPath $p) | Should Be $true
+    $errs = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$errs)
+    @($errs).Count | Should Be 0
+    $src = Read-NetEnvFileText $p
+    # 反向断言：配置里的端口号不得作为字面量出现（改端口后脚本必须跟着走，否则又是"两处判据"）
+    $src.Contains([string](Read-NetEnvConfig).ports.mihomoHttp) | Should Be $false
+  }
+
+  It '切档必须走官方 apply 入口，不得自己写注册表' {
+    $src = Read-NetEnvFileText (Join-Path $root 'fix-browser-proxy.ps1')
+    $src | Should Match "netenv\.ps1'\) apply -profile"
+    # 系统代理的唯一写入点是 core.ps1 的 Set-NetEnvProxyReg（apply 与自愈循环共用）。
+    # 脚本自己写注册表会绕过快照与档位语义，且会被 supervisor-loop 按档位期望值改回去。
+    $src | Should Not Match 'Set-ItemProperty'
+  }
+
+  It '调用的 NetEnv 函数必须都能解析（脚本只 dot-source core.ps1）' {
+    $src = Read-NetEnvFileText (Join-Path $root 'fix-browser-proxy.ps1')
+    $called = [regex]::Matches($src, '\b((?:Invoke|Test|Get|Set|Read|Save|Write|Update|ConvertTo|ConvertFrom|Remove|Ensure|Build|Start|Stop)-NetEnv[A-Za-z0-9]+)\b') |
+      ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    $core = [regex]::Matches((Read-NetEnvFileText (Join-Path $root 'lib\core.ps1')), '(?m)^\s*function\s+([A-Za-z0-9\-]+)') |
+      ForEach-Object { $_.Groups[1].Value }
+    $unresolved = @($called | Where-Object { $core -notcontains $_ })
+    ($unresolved -join ', ') | Should Be ''
+  }
+}
+
 Describe '自愈链重载助手' {
   It '配置文件不存在时返回 false，不抛错（重载失败不得打断自愈循环）' {
     (Update-NetEnvMihomoConfig -ControllerPort 1 -ConfigPath (Join-Path $env:TEMP 'netenv-no-such-merged.yaml')) | Should Be $false

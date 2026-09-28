@@ -27,6 +27,7 @@
 ```text
 netenv.ps1          主入口（调度器 + 实例锁）
 netenv-mcp.ps1      MCP stdio server（JSON-RPC 2.0，默认只读）
+fix-browser-proxy.ps1  一键切档修"浏览器打不开 GitHub"（github 档 systemProxy=false，浏览器直连即超时）并做落盘验收
 lib/                core.ps1 + 命令模块 + supervisor/supervisor-loop（常驻自愈）+ run-supervisor-hidden.vbs（零窗口启动器）
 config/             netenv.json / sources.json / clients.json（默认值，不含密钥）
 docs/               文档（见下方索引）

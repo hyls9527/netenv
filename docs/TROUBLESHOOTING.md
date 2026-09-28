@@ -31,7 +31,8 @@
 - **`tests\netenv.tests.ps1` 在 Pester 3.4.0 下失败**（历史记录，已修复）：
   1. `Describe 'NetEnv config'` 报 `PSInvalidCastException` —— Pester 3 的 `Describe` 第二参数必须是 ScriptBlock，测试却传了字符串；
   2. `$out | Should Match 'name: auto-select'` 断言组名 `auto-select`，但 `Build-NetEnvMergedConfig` 生成的是 `auto-urltest`。
-  两者都是**测试与实现的历史漂移**，已按实现修正断言；当前 20 个用例全绿（`.\tests\regression.ps1`）。
+  两者都是**测试与实现的历史漂移**，已按实现修正断言；当时 20 个用例全绿（用例数会随守卫增补上涨，
+  以 `.\tests\regression.ps1` 的实际输出为准，不要照抄数字）。
 - 测试文件中的 `ghp_...` 字面量是**脱敏用例的样本值**，不是真实凭据，无需处理。
 - **`doctor --json` 或 MCP `netenv_doctor_summary` 报 `Argument types do not match`**：
   Windows PowerShell 5.1 下 `@($genericListOfObject)` 会抛 `ArgumentException`（`List[string]`、`Object[]` 均正常，实测 5.1.26100）。
@@ -65,6 +66,15 @@
   7-Zip 用 `a -t7z -p<pw> -mhe=on`；Bandizip 用 `a -fmt:7z -p:<pw>`（其 7z 加密头默认开启，实测无密码无法列出条目名）。
 - **代理端口在听但打不开网页**：先跑 `netenv doctor`，看 `端到端出品（经代理实测）` 这一项。
   它走真实请求，能区分"进程活着"与"出口可用"；`data/health-state.json` 记录连续失败次数。
+- **浏览器（Edge/Chrome）打不开 GitHub，但同一时刻 `git` / CLI 正常**：这是**档位语义**，不是故障。
+  `github` 档 `systemProxy=false`（只注入 git 代理与环境变量），而浏览器吃的是 WinINET 系统代理，
+  于是它**直连**被墙目标直到超时（Edge 报 `ERR_CONNECTION_TIMED_OUT`）。
+  一键切档并验收：`powershell -NoProfile -ExecutionPolicy Bypass -File .\fix-browser-proxy.ps1`
+  （默认切 `proxy` 档；用完 `-Profile github` 切回 CLI 档，`-NoProbe` 可离线只做落盘验收）。
+  - **不要手改注册表**：`supervisor-loop` 每轮按档位期望值回写系统代理（见 README「系统代理漂移自愈」），
+    手改会被改回去；该脚本走官方 `netenv.ps1 apply`，保留快照与 git/npm/环境变量的同档语义。
+  - 浏览器需**完全退出重开**：WinINET 设置对已运行进程不一定即时生效。
+  - 验收仍失败时按上面「装了第三方 VPN」一节处置（`doctor` 的 `VPN 类接管` 看多默认路由）。
 - **装了第三方 VPN（Proton VPN / WireGuard / 其他代理客户端）后，某天开机代理全废**：
   与 mihomo **不是端口冲突，而是抢夺同一层网络状态**。三条已验证的互斥通道：
   1. **系统代理**：VPN 客户端连接/断开时接管 WinINET 的 `ProxyEnable/ProxyServer`，谁最后写谁赢。
