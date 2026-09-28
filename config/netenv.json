@@ -35,7 +35,19 @@
                                        "failThreshold":  2,
                                        "group":  "github-adaptive",
                                        "recoverMinIntervalMinutes":  10
-                                   }
+                                   },
+                   "gptProbe":  {
+                                    "enabled":  true,
+                                    "probeUrls":  [
+                                                      "https://api.openai.com/v1/models"
+                                                  ],
+                                    "failThreshold":  2,
+                                    "group":  "gpt-adaptive",
+                                    "rotateGroup":  "gpt-node",
+                                    "rankGroup":  "auto-urltest",
+                                    "maxCandidates":  8,
+                                    "recoverMinIntervalMinutes":  10
+                                }
                },
     "sensitiveDomains":  [
                              "*.163.com/mail",
@@ -93,6 +105,13 @@
                                   "raw.githubusercontent.com",
                                   "ssh.github.com"
                               ],
+    "gptAdaptiveDomains":  [
+                               "chatgpt.com",
+                               "openai.com",
+                               "oaistatic.com",
+                               "oaiusercontent.com",
+                               "chatgpt.livekit.cloud"
+                           ],
     "subscription":  {
                          "urlTest":  {
                                          "url":  "https://www.google.com/generate_204",
@@ -105,7 +124,13 @@
                                                "interval":  60,
                                                "tolerance":  50,
                                                "lazy":  true
-                                           }
+                                           },
+                         "gptUrlTest":  {
+                                            "url":  "https://chatgpt.com/cdn-cgi/trace",
+                                            "interval":  60,
+                                            "tolerance":  50,
+                                            "lazy":  true
+                                        }
                      },
     "noProxy":  [
                     "*.cn",

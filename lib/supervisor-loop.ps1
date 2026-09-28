@@ -59,6 +59,36 @@ if ($cfg.health -and $cfg.health.githubProbe) {
 if ($githubFailThreshold -lt 1) { $githubFailThreshold = 2 }
 if ($githubRecoverMinInterval -lt 0) { $githubRecoverMinInterval = 0 }
 
+# GPT（OpenAI/ChatGPT）专项探针的配置。判据独立，且比 github 多一层"地区"判别 —— 见
+# core.ps1 的 ConvertTo-NetEnvGptProbeResult：免费节点里大量是香港，而香港是 OpenAI
+# **不支持地区**，只看连通性会把它们判成健康，症状是"能连上 chatgpt.com 却报地区不支持"。
+$gptProbeOn = $false
+$gptProbeUrls = @('https://api.openai.com/v1/models')
+$gptFailThreshold = 2
+$gptAdaptiveGroup = 'gpt-adaptive'
+$gptRotateGroup = 'gpt-node'
+$gptRankGroup = 'auto-urltest'
+$gptMaxCandidates = 8
+$gptRecoverMinInterval = 10
+$gptLatencyUrl = 'https://chatgpt.com/cdn-cgi/trace'
+if ($cfg.health -and $cfg.health.gptProbe) {
+  $tp = $cfg.health.gptProbe
+  if ($null -ne $tp.enabled) { $gptProbeOn = [bool]$tp.enabled }
+  # 过滤空串：探针 URL 为空会让 Test-NetEnvGptEgress 回退到默认值，那就探错了对象
+  if ($tp.probeUrls) { $gptProbeUrls = @($tp.probeUrls | Where-Object { $_ }) }
+  if (@($gptProbeUrls).Count -eq 0) { $gptProbeUrls = @('https://api.openai.com/v1/models') }
+  if ($tp.failThreshold) { $gptFailThreshold = [int]$tp.failThreshold }
+  if ($tp.group) { $gptAdaptiveGroup = [string]$tp.group }
+  if ($tp.rotateGroup) { $gptRotateGroup = [string]$tp.rotateGroup }
+  if ($tp.rankGroup) { $gptRankGroup = [string]$tp.rankGroup }
+  if ($tp.maxCandidates) { $gptMaxCandidates = [int]$tp.maxCandidates }
+  if ($null -ne $tp.recoverMinIntervalMinutes) { $gptRecoverMinInterval = [int]$tp.recoverMinIntervalMinutes }
+}
+if ($cfg.subscription -and $cfg.subscription.gptUrlTest -and $cfg.subscription.gptUrlTest.url) { $gptLatencyUrl = [string]$cfg.subscription.gptUrlTest.url }
+if ($gptFailThreshold -lt 1) { $gptFailThreshold = 2 }
+if ($gptRecoverMinInterval -lt 0) { $gptRecoverMinInterval = 0 }
+if ($gptMaxCandidates -lt 1) { $gptMaxCandidates = 8 }
+
 $controllerPort = 19090
 if ($cfg.ports -and $cfg.ports.mihomoController) { $controllerPort = [int]$cfg.ports.mihomoController }
 $mergedFile = Join-Path $paths.Data 'merged.yaml'
@@ -72,12 +102,36 @@ $lastProxyRepair = (Get-Date).AddMinutes(-$proxyRepairMinInterval - 1)
 
 Write-NetEnvLog 'INFO' "supervisor-loop: 启动，进程探活 $interval 分钟 / 出品探针 $probeInterval 分钟 / 目标 $($probeUrls -join ' | ')"
 if ($githubProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: github 专项探针 启用 / 目标 $($githubProbeUrls -join ' | ') / 连败 $githubFailThreshold 次触发 $githubGroup 组测速" }
+if ($gptProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: GPT 专项探针 启用 / 目标 $($gptProbeUrls -join ' | ') / 连败 $gptFailThreshold 次触发 $gptRotateGroup 节点轮换（地区判据）" }
 
 $healthFile = Join-Path $paths.Data 'health-state.json'
 $lastProbe = (Get-Date).AddMinutes(-$probeInterval - 1)
 
 while ($true) {
   try { & "$PSScriptRoot\supervisor.ps1" } catch { Write-NetEnvLog 'ERROR' "supervisor-loop: 单轮异常 $_" }
+
+  # ---- GPT 已验证节点的重放（每轮都查，独立于 5 分钟的探针周期）----
+  # 必要性：mihomo 重载配置（nodes refresh / apply）后，select 组会重置回首个成员；
+  # 不重放的话 GPT 会静默走回"未验证、甚至 OpenAI 不支持地区"的节点，而探针要 5 分钟后才发现。
+  if ($gptProbeOn) {
+    try {
+      $wantNode = Get-NetEnvGptSelectedNode
+      if ($wantNode) {
+        $curNode = $null
+        try {
+          # 必须用 UTF-8 读取：节点名含 emoji，Invoke-WebRequest 会按 ISO-8859-1 解码成乱码，
+          # 于是"当前节点 != 已验证节点"永远成立、每轮白做一次 PUT（见 core.ps1 的同名注释）
+          $pj = Get-NetEnvJsonUtf8 -Uri "http://127.0.0.1:$controllerPort/proxies/$gptRotateGroup" -TimeoutSec 8
+          $curNode = [string]$pj.now
+        } catch { $curNode = $null }
+        if ($curNode -and $curNode -ne $wantNode) {
+          if (Set-NetEnvGptSelectedNode -Node $wantNode -ControllerPort $controllerPort) {
+            Write-NetEnvLog 'INFO' "GPT 已验证节点重放：$curNode → $wantNode（配置重载后 select 组会回到默认成员）"
+          }
+        }
+      }
+    } catch { Write-NetEnvLog 'WARN' "GPT 节点重放异常：$_" }
+  }
 
   # ---- 系统代理漂移自愈（每轮都查，与出品探针的 5 分钟周期无关）----
   # 只在"当前档位期望开启系统代理"时才动手：direct/github 档下 ProxyEnable=0 是预期状态，
@@ -102,7 +156,7 @@ while ($true) {
     $lastProbe = Get-Date
     # 键必须齐全：下面的加载只遍历本哈希表的默认键，漏掉的键读不到已存值、每轮都被重置
     # （与当年 lastRefreshAt 退避失效同一类坑）。
-    $st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null; lastRefreshAt = $null; githubConsecutiveFail = 0; githubLastOk = $null; githubLastError = $null; githubProbedAt = $null; githubLastRecoverAt = $null }
+    $st = @{ consecutiveFail = 0; lastOk = $null; lastOkMs = $null; lastError = $null; probedAt = $null; lastRefreshAt = $null; githubConsecutiveFail = 0; githubLastOk = $null; githubLastError = $null; githubProbedAt = $null; githubLastRecoverAt = $null; gptConsecutiveFail = 0; gptLastOk = $null; gptLastError = $null; gptProbedAt = $null; gptLastRecoverAt = $null }
     if (Test-Path -LiteralPath $healthFile) {
       try {
         $loaded = (Read-NetEnvFileText $healthFile) | ConvertFrom-Json
@@ -233,6 +287,56 @@ while ($true) {
               }
             } else {
               Write-NetEnvLog 'ERROR' "github 组测速未取到任何可用成员（$($rec.Detail)）"
+            }
+          }
+        }
+      }
+    }
+
+    # ---- GPT 专项探针：判据独立于出品 OR，且比 github 多一层"地区"判别 ----
+    # 为什么独立：出品 OR 里 google 通即算可用，而 google 通不代表 OpenAI 可达 ——
+    # 免费节点大量是香港（OpenAI 不支持地区），chatgpt.com 会应用层 403 而所有连通性探针全绿。
+    # 恢复动作也不是刷订阅：同批节点里本来就有地区受支持的，对症做法是换节点（逐个用地区判据复测）。
+    if ($gptProbeOn) {
+      $tr = Test-NetEnvGptEgress -ProbeUrl $gptProbeUrls[0]
+      $st.gptProbedAt = (Get-Date -Format 's')
+      if ($tr.Ok) {
+        if ([int]$st.gptConsecutiveFail -ne 0) { Write-NetEnvLog 'INFO' "GPT 探针恢复：HTTP $($tr.Status) $($tr.Ms)ms" }
+        $st.gptConsecutiveFail = 0
+        $st.gptLastOk = (Get-Date -Format 's')
+        $st.gptLastError = $null
+      } else {
+        $st.gptConsecutiveFail = [int]$st.gptConsecutiveFail + 1
+        $st.gptLastError = [string]$tr.Reason
+        Write-NetEnvLog 'WARN' "GPT 探针失败（第 $($st.gptConsecutiveFail)/$gptFailThreshold 次）：$($tr.Reason)（HTTP $($tr.Status)）"
+
+        if ([int]$st.gptConsecutiveFail -ge $gptFailThreshold) {
+          $lastGptRecover = $null
+          if ($st.gptLastRecoverAt) {
+            try { $lastGptRecover = [datetime]$st.gptLastRecoverAt } catch { $lastGptRecover = $null }
+          }
+          if ($lastGptRecover -and ((Get-Date) - $lastGptRecover).TotalMinutes -lt $gptRecoverMinInterval) {
+            $tAgoMin = [int]((Get-Date) - $lastGptRecover).TotalMinutes
+            Write-NetEnvLog 'WARN' "GPT 不可用，但距上次节点轮换仅 $tAgoMin 分钟（下限 $gptRecoverMinInterval 分钟），本轮跳过"
+          } else {
+            Write-NetEnvLog 'WARN' "GPT 不可用 → 轮换 $gptRotateGroup 节点（按地区判据逐个复测）"
+            # 先记账再动手（与出品/github 链同口径）：轮换自身抛错时同样要退避
+            $st.gptLastRecoverAt = (Get-Date -Format 's')
+            $rot = Invoke-NetEnvGptNodeRotation -Group $gptRotateGroup -AdaptiveGroup $gptAdaptiveGroup -ProbeUrl $gptProbeUrls[0] -LatencyUrl $gptLatencyUrl -RankGroup $gptRankGroup -ControllerPort $controllerPort -MaxCandidates $gptMaxCandidates
+            if ($rot.Ok) {
+              Write-NetEnvLog 'INFO' "GPT 节点已轮换：$($rot.Node)（$($rot.Detail)），复测中"
+              Start-Sleep -Seconds 3
+              $tr2 = Test-NetEnvGptEgress -ProbeUrl $gptProbeUrls[0]
+              if ($tr2.Ok) {
+                Write-NetEnvLog 'INFO' "GPT 已恢复：HTTP $($tr2.Status) $($tr2.Ms)ms（节点 $($rot.Node)）"
+                $st.gptConsecutiveFail = 0
+                $st.gptLastOk = (Get-Date -Format 's')
+                $st.gptLastError = $null
+              } else {
+                Write-NetEnvLog 'ERROR' "轮换到 $($rot.Node) 后 GPT 仍不可用：$($tr2.Reason)"
+              }
+            } else {
+              Write-NetEnvLog 'ERROR' "GPT 节点轮换失败：$($rot.Detail)"
             }
           }
         }

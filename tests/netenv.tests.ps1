@@ -182,6 +182,11 @@ proxies:
       $out | Should Match 'DOMAIN-SUFFIX,ssh.github.com,github-adaptive'
       # 内容域走自适应（可用性保底）
       $out | Should Match 'DOMAIN-SUFFIX,github.com,github-adaptive'
+      # GPT 分流：OpenAI/ChatGPT 走 gpt-adaptive；gpt-node 是 select，由自愈循环按地区判据轮换
+      $out | Should Match 'name: gpt-node'
+      $out | Should Match 'name: gpt-adaptive'
+      $out | Should Match 'DOMAIN-SUFFIX,chatgpt.com,gpt-adaptive'
+      $out | Should Match 'DOMAIN-SUFFIX,openai.com,gpt-adaptive'
       # 同一域名不得重复出规则
       $doms = [regex]::Matches($out, '(?m)^\s+-\s+DOMAIN-SUFFIX,([^,]+),') | ForEach-Object { $_.Groups[1].Value }
       $dupDom = $doms | Group-Object | Where-Object { $_.Count -gt 1 }
@@ -312,12 +317,16 @@ Describe 'doctor JSON 输出' {
     function Get-ScheduledTask { [CmdletBinding()] param() }
     function Get-CimInstance { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
     function Get-NetTCPConnection { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    function Test-NetEnvGptEgress { param([string]$ProbeUrl, [int]$ProxyPort, [int]$TimeoutSec)
+      [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 1; Url = $ProbeUrl; Reason = $null } }
     $raw = Invoke-NetEnvDoctor -Json -NoExit
     $obj = $raw | ConvertFrom-Json
     ($obj.PSObject.Properties.Name -contains 'ok') | Should Be $true
     ($obj.PSObject.Properties.Name -contains 'fails') | Should Be $true
     @($obj.checks).Count | Should BeGreaterThan 0
     @($obj.checks | Where-Object { $_.id -eq 'egress' }).Count | Should Be 1
+    # GPT 验收项必须出现在体检表里（长期访问 GPT 的可见入口）
+    @($obj.checks | Where-Object { $_.id -eq 'gpt' }).Count | Should Be 1
     # fail 计数必须与 checks 里 ok=false 的条数一致（防统计与实际状态漂移）
     @($obj.checks | Where-Object { -not $_.ok }).Count | Should Be ([int]$obj.fails)
   }
@@ -476,6 +485,81 @@ Describe 'github 专项探针' {
     $m = [regex]::Match($loop, '(?m)^\s*\$st = @\{([^}]*)\}')
     $m.Success | Should Be $true
     foreach ($k in @('githubConsecutiveFail', 'githubProbedAt', 'githubLastOk', 'githubLastError', 'githubLastRecoverAt')) {
+      $m.Groups[1].Value | Should Match $k
+    }
+  }
+}
+
+Describe 'GPT 专项（长期可访问）' {
+  # 背景：本机长期需要访问 GPT。免费节点池里大量是香港，而香港是 OpenAI **不支持地区** ——
+  # TCP/TLS 与 Cloudflare 边缘全通、chatgpt.com 却应用层 403。实测 mihomo 的 /delay 测速
+  # 对 401/403 一律返回正延迟（只看连通、不看状态码），所以"按延迟选点"必然选错。
+  # 因此：探针必须用可判地区的响应码，节点组必须可被钉住（select 而非 url-test），
+  # 恢复动作是按地区判据轮换节点而不是刷订阅。
+  It '地区判据：200/401/429 视为可达；403 视为不可达并区分地区封锁' {
+    (ConvertTo-NetEnvGptProbeResult -HttpCode 401).Ok | Should Be $true
+    (ConvertTo-NetEnvGptProbeResult -HttpCode 200).Ok | Should Be $true
+    (ConvertTo-NetEnvGptProbeResult -HttpCode 429).Ok | Should Be $true
+    $region = ConvertTo-NetEnvGptProbeResult -HttpCode 403 -Body '{"error":{"code":"unsupported_country_region_territory"}}'
+    $region.Ok | Should Be $false
+    $region.Reason | Should Be 'region-unsupported'
+    # 不带地区码的 403（风控/挑战）同样是不可用，不得当成成功
+    (ConvertTo-NetEnvGptProbeResult -HttpCode 403 -Body 'nope').Ok | Should Be $false
+    (ConvertTo-NetEnvGptProbeResult -HttpCode 0).Ok | Should Be $false
+    # Cloudflare 源站类瞬时错误要能与其他失败区分（实测 doctor 撞到过一次 520）
+    $cf = ConvertTo-NetEnvGptProbeResult -HttpCode 520
+    $cf.Ok | Should Be $false
+    $cf.Reason | Should Be 'cf-origin-error'
+    (ConvertTo-NetEnvGptProbeResult -HttpCode 503).Reason | Should Be 'upstream-error'
+  }
+
+  It '探针目标必须是可判地区的端点（换成任何地区都 200 的 URL 会让判据失效）' {
+    $cfg = Read-NetEnvConfig
+    $cfg.health.gptProbe | Should Not BeNullOrEmpty
+    @($cfg.health.gptProbe.probeUrls).Count | Should BeGreaterThan 0
+    $cfg.health.gptProbe.probeUrls[0] | Should Match 'api\.openai\.com'
+    [int]$cfg.health.gptProbe.failThreshold | Should BeGreaterThan 0
+    [int]$cfg.health.gptProbe.recoverMinIntervalMinutes | Should BeGreaterThan 0
+    [int]$cfg.health.gptProbe.maxCandidates | Should BeGreaterThan 0
+    $cfg.health.gptProbe.group | Should Be 'gpt-adaptive'
+    $cfg.health.gptProbe.rotateGroup | Should Be 'gpt-node'
+    # 延迟排名来源必须是 url-test 组（全池延迟由它提供）
+    $cfg.health.gptProbe.rankGroup | Should Be 'auto-urltest'
+    $cfg.subscription.gptUrlTest.url | Should Match '^https://'
+    @($cfg.gptAdaptiveDomains).Count | Should BeGreaterThan 0
+  }
+
+  It 'GPT 域名不得同时出现在直连与自适应列表（DIRECT 规则在前会让自适应永不可达）' {
+    $cfg = Read-NetEnvConfig
+    $direct = @($cfg.sensitiveDomains) + @($cfg.githubAuthDomains)
+    $overlap = @($cfg.gptAdaptiveDomains | Where-Object { $direct -contains $_ })
+    $overlap.Count | Should Be 0
+  }
+
+  It 'gpt-node / gpt-adaptive 必须是 select（url-test 无法被钉住，也就无法按地区判据轮换）' {
+    $nodes = Read-NetEnvFileText (Join-Path $root 'lib\nodes.ps1')
+    $m = [regex]::Match($nodes, '(?ms)-\s*name:\s*gpt-node\s*\r?\n\s*type:\s*(\w+)')
+    $m.Success | Should Be $true
+    $m.Groups[1].Value | Should Be 'select'
+    $m2 = [regex]::Match($nodes, '(?ms)-\s*name:\s*gpt-adaptive\s*\r?\n\s*type:\s*(\w+)')
+    $m2.Success | Should Be $true
+    $m2.Groups[1].Value | Should Be 'select'
+  }
+
+  It 'supervisor-loop 必须独立探 GPT 并调用节点轮换（出品 OR 判据发现不了地区封锁）' {
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $loop | Should Match 'gptProbe'
+    $loop | Should Match 'Test-NetEnvGptEgress'
+    $loop | Should Match 'Invoke-NetEnvGptNodeRotation'
+    # mihomo 重载配置后 select 组会回到默认成员，必须每轮重放已验证节点
+    $loop | Should Match 'Get-NetEnvGptSelectedNode'
+  }
+
+  It 'GPT 探针的状态键必须在 health-state 默认键表内（漏了会每轮被重置、阈值失效）' {
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    $m = [regex]::Match($loop, '(?m)^\s*\$st = @\{([^}]*)\}')
+    $m.Success | Should Be $true
+    foreach ($k in @('gptConsecutiveFail', 'gptProbedAt', 'gptLastOk', 'gptLastError', 'gptLastRecoverAt')) {
       $m.Groups[1].Value | Should Match $k
     }
   }

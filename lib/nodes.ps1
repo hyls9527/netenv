@@ -251,6 +251,17 @@ function Build-NetEnvMergedConfig {
   $adaptiveRuleLines = foreach ($dom in $adaptiveDomains) { "    - DOMAIN-SUFFIX,$dom,github-adaptive" }
   $adaptiveRuleText = $adaptiveRuleLines -join "`n"
 
+  # GPT 分流：与 githubAdaptiveDomains 同一套写法（域名去 *./路径后缀再生成 DOMAIN-SUFFIX）。
+  # 必须放在 GEOSITE,cn 之前，否则 openai.com 之类的境外域不会被误判——但 gemini/其他
+  # 国内 CDN 域名若被写进来就会抢占，故这里只列 OpenAI 自有域与静态资源域。
+  $gptDomains = @()
+  foreach ($d in @($Cfg.gptAdaptiveDomains)) {
+    $dom = (($d -replace '^\*\.', '') -split '/')[0]
+    if ($dom -and ($gptDomains -notcontains $dom)) { $gptDomains += $dom }
+  }
+  $gptRuleLines = foreach ($dom in $gptDomains) { "    - DOMAIN-SUFFIX,$dom,gpt-adaptive" }
+  $gptRuleText = $gptRuleLines -join "`n"
+
   $groupNames = foreach ($n in $order) {
     $esc = $n.Replace('\', '\\').Replace('"', '\"')
     "      - `"$esc`""
@@ -305,6 +316,7 @@ proxy-groups:
     proxies:
       - auto-urltest
       - github-node
+      - gpt-node
       - DIRECT
   - name: auto-urltest
     type: url-test
@@ -338,9 +350,25 @@ $($groupNames -join "`n")
       - github-node
       - proxy-select
       - DIRECT
+  # GPT（OpenAI / ChatGPT）专用组。为什么不能只靠 url-test 选点：实测 mihomo 测速**只看连通、
+  # 不看状态码**（chatgpt.com 的 403 挑战与 api.openai.com 的 401/403 都返回正延迟），
+  # 于是"延迟最低"的香港节点必被选中 —— 而香港是 OpenAI 不支持地区，GPT 会应用层 403。
+  # 因此 gpt-node 用 select：由 supervisor-loop 用真实响应码轮换并钉住"地区受支持"的节点
+  # （见 core.ps1 的 Invoke-NetEnvGptNodeRotation）；gpt-adaptive 是顶层入口 + 人工兜底。
+  - name: gpt-node
+    type: select
+    proxies:
+$($groupNames -join "`n")
+  - name: gpt-adaptive
+    type: select
+    proxies:
+      - gpt-node
+      - proxy-select
+      - DIRECT
 rules:
 $ruleText
 $adaptiveRuleText
+$gptRuleText
     - GEOSITE,cn,DIRECT
     - GEOIP,CN,DIRECT,no-resolve
     - MATCH,proxy-select

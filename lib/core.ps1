@@ -499,6 +499,221 @@ function Test-NetEnvEgressAny {
   return $last
 }
 
+# ---- GPT（OpenAI / ChatGPT）可达性 ----
+# 为什么不能沿用"能连上就算通"：OpenAI 对**不受支持地区**在应用层返回 403
+# （响应体里是 unsupported_country_region_territory），而 TCP/TLS 与 Cloudflare 边缘都是通的。
+# 实测 mihomo 的 /delay 测速对 401/403 一律返回正延迟（只看连通、不看状态码），
+# 因此任何 url-test 组都会把延迟最低的香港节点选进来 —— 香港恰是 OpenAI 不支持地区，
+# 结果就是"GPT 长期时好时坏、换节点也白换"。地区判据只能由真实响应码给出。
+function ConvertTo-NetEnvGptProbeResult {
+  param([int]$HttpCode = 0, [string]$Body)
+  $ok = $false
+  $reason = $null
+  # 200/401/429 均视为可达：401 = 地区受支持、仅缺密钥；429 = 可达但被限流。
+  if ($HttpCode -eq 200 -or $HttpCode -eq 201 -or $HttpCode -eq 401 -or $HttpCode -eq 429) {
+    $ok = $true
+  } elseif ($HttpCode -eq 403 -and $Body -match 'unsupported_country_region_territory') {
+    $reason = 'region-unsupported'
+  } elseif ($HttpCode -eq 403) {
+    $reason = 'forbidden'
+  } elseif ($HttpCode -ge 520 -and $HttpCode -le 526) {
+    # Cloudflare 源站类错误：免费出口的瞬时抖动（实测 doctor 撞到过一次 520，同一节点
+    # 3 秒后连测三次全是 401）。判据上仍算不可用，但要给出可区分的原因，别混进 unreachable。
+    $reason = 'cf-origin-error'
+  } elseif ($HttpCode -ge 500) {
+    $reason = 'upstream-error'
+  } else {
+    $reason = 'unreachable'
+  }
+  return [PSCustomObject]@{ Ok = $ok; Status = $HttpCode; Reason = $reason }
+}
+
+function Test-NetEnvGptEgress {
+  # GPT 可达性判据（经代理实测）。返回 Ok/Status/Ms/Url/Reason。
+  # 用 curl 而不是 Invoke-WebRequest：需要拿到 403 的**响应体**来区分"地区不受支持"与
+  # "其他拒绝"，而 Invoke-WebRequest 在 4xx 上抛异常、只能从 ErrorDetails 里抠，脆弱且易漏。
+  param(
+    [string]$ProbeUrl = 'https://api.openai.com/v1/models',
+    [int]$ProxyPort,
+    [int]$TimeoutSec = 12,
+    [int]$Attempts = 1
+  )
+  $cfg = Read-NetEnvConfig -Quiet
+  if (-not $ProxyPort) {
+    if ($cfg -and $cfg.ports -and $cfg.ports.mihomoHttp) { $ProxyPort = [int]$cfg.ports.mihomoHttp } else { $ProxyPort = 7897 }
+  }
+  # $Attempts>1 只给 doctor 这类"一次性验收"用：免费出口偶发 520/超时不应把验收判死。
+  # 自愈循环刻意用默认 1 次 —— 它的容错在"连续 N 轮失败"上（failThreshold），
+  # 若在单轮内部重试，退避与阈值语义都会被打乱。
+  $result = $null
+  $total = [int]$Attempts
+  if ($total -lt 1) { $total = 1 }
+  for ($attempt = 1; $attempt -le $total; $attempt++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $bodyFile = Join-Path $env:TEMP ('netenv-gpt-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
+    try {
+      # 必须带浏览器 UA：裸 curl 会被 Cloudflare 直接 403，把"地区受支持"误判成"被拒"
+      $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      $out = & curl.exe -s -A $ua -o $bodyFile -w '%{http_code}' -x ("http://127.0.0.1:$ProxyPort") --connect-timeout $TimeoutSec --max-time ($TimeoutSec * 2) $ProbeUrl 2>$null
+      $codeText = ($out -join '').Trim()
+      $code = 0
+      if ($codeText -match '^\d{3}$') { $code = [int]$codeText }
+      $body = ''
+      if (Test-Path -LiteralPath $bodyFile) { $body = Read-NetEnvFileText $bodyFile }
+      $sw.Stop()
+      $mapped = ConvertTo-NetEnvGptProbeResult -HttpCode $code -Body $body
+      $result = [PSCustomObject]@{ Ok = $mapped.Ok; Status = $mapped.Status; Ms = $sw.ElapsedMilliseconds; Url = $ProbeUrl; Reason = $mapped.Reason }
+    } catch {
+      $sw.Stop()
+      $result = [PSCustomObject]@{ Ok = $false; Status = 0; Ms = $sw.ElapsedMilliseconds; Url = $ProbeUrl; Reason = 'exception' }
+    } finally {
+      Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($result.Ok -or $attempt -ge $total) { break }
+    Start-Sleep -Seconds 1
+  }
+  return $result
+}
+
+# mihomo 控制器的响应是 JSON 但**不带 charset**：Windows PowerShell 5.1 的 Invoke-WebRequest
+# 在缺 charset 时按 ISO-8859-1 解码，节点名里的 emoji 会被读成乱码（实测 "🔴..." 读成 "ð..."，
+# 码点 240,159,148，而正确的 UTF-8 解码是代理对 55357,56628）。拿乱码名字回 PUT "选择节点"
+# 必然匹配不到成员（400），GPT 节点轮换会静默全灭。这两个助手显式按 UTF-8 收发；
+# 凡是控制器调用涉及**节点名**（而非 ASCII 组名）的都必须走它们。
+function Get-NetEnvJsonUtf8 {
+  param([string]$Uri, [int]$TimeoutSec = 30)
+  $req = [System.Net.HttpWebRequest]::Create($Uri)
+  $req.Method = 'GET'
+  $req.Timeout = $TimeoutSec * 1000
+  $req.ReadWriteTimeout = $TimeoutSec * 1000
+  $resp = $req.GetResponse()
+  try {
+    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream(), (New-Object System.Text.UTF8Encoding($false)))
+    try { $json = $sr.ReadToEnd() } finally { $sr.Dispose() }
+  } finally { $resp.Close() }
+  return ($json | ConvertFrom-Json)
+}
+
+function Invoke-NetEnvJsonPut {
+  param([string]$Uri, [string]$Json, [int]$TimeoutSec = 15)
+  $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes([string]$Json)
+  $req = [System.Net.HttpWebRequest]::Create($Uri)
+  $req.Method = 'PUT'
+  $req.ContentType = 'application/json'
+  $req.Timeout = $TimeoutSec * 1000
+  $req.ReadWriteTimeout = $TimeoutSec * 1000
+  $req.ContentLength = $bytes.Length
+  $s = $req.GetRequestStream()
+  try { $s.Write($bytes, 0, $bytes.Length) } finally { $s.Dispose() }
+  $resp = $req.GetResponse()
+  $resp.Close()
+  return $true
+}
+
+function Get-NetEnvGptSelectedNode {
+  # 上次轮换验证通过的节点（data/gpt-state.json）。文件缺失/损坏一律返回 $null，不抛。
+  $f = Join-Path (Get-NetEnvPaths).Data 'gpt-state.json'
+  if (-not (Test-Path -LiteralPath $f)) { return $null }
+  try {
+    $o = (Read-NetEnvFileText $f) | ConvertFrom-Json
+    if ($o.node) { return [string]$o.node }
+  } catch { }
+  return $null
+}
+
+function Set-NetEnvGptSelectedNode {
+  # 把 select 组 gpt-node 切到指定节点。失败返回 $false、不抛（自愈循环不得被打断）。
+  param([string]$Node, [int]$ControllerPort = 19090)
+  if (-not $Node) { return $false }
+  try {
+    # 必须走 UTF-8 PUT：节点名含 emoji，走 Invoke-WebRequest 会以乱码匹配（见上方注释）
+    [void](Invoke-NetEnvJsonPut -Uri "http://127.0.0.1:$ControllerPort/proxies/gpt-node" -Json (@{ name = $Node } | ConvertTo-Json) -TimeoutSec 10)
+    return $true
+  } catch { return $false }
+}
+
+function Invoke-NetEnvGptNodeRotation {
+  # GPT 节点轮换：用**真实响应码**逐个复测候选节点，把 gpt-node 钉在"地区受支持"的节点上。
+  # 为什么必须自己轮换而不是交给 url-test：见 ConvertTo-NetEnvGptProbeResult 的注释 ——
+  # mihomo 测速不看状态码，香港节点延迟最低却对 OpenAI 是不受支持地区。
+  # 候选顺序：先复测当前节点（避免无谓切换），再按延迟从快到慢取前 N 个；
+  # 第一个通过地区探针的节点胜出并持久化到 data/gpt-state.json（供 reload 后重放）；全部失败则还原。
+  param(
+    [string]$Group = 'gpt-node',
+    [string]$AdaptiveGroup = 'gpt-adaptive',
+    [string]$ProbeUrl = 'https://api.openai.com/v1/models',
+    [string]$LatencyUrl = 'https://chatgpt.com/cdn-cgi/trace',
+    [string]$RankGroup = 'auto-urltest',
+    [int]$ControllerPort = 19090,
+    [int]$MaxCandidates = 8,
+    [int]$ProbeTimeoutSec = 10
+  )
+  $api = "http://127.0.0.1:$ControllerPort"
+  $tested = New-Object System.Collections.Generic.List[string]
+  try {
+    $proxies = Get-NetEnvJsonUtf8 -Uri "$api/proxies" -TimeoutSec 10
+  } catch {
+    Write-NetEnvLog 'WARN' "GPT 节点轮换：控制器不可达（$api）"
+    return [PSCustomObject]@{ Ok = $false; Node = $null; Detail = 'controller-unreachable' }
+  }
+  $entry = $proxies.proxies.PSObject.Properties[$Group]
+  if (-not $entry) {
+    Write-NetEnvLog 'WARN' "GPT 节点轮换：组 $Group 不存在（需 nodes refresh 生成 gpt 组）"
+    return [PSCustomObject]@{ Ok = $false; Node = $null; Detail = 'group-missing' }
+  }
+  $original = [string]$entry.Value.now
+
+  $ranked = New-Object System.Collections.Generic.List[object]
+  try {
+    $esc = [System.Uri]::EscapeDataString($LatencyUrl)
+    $raw = Get-NetEnvJsonUtf8 -Uri "$api/group/$RankGroup/delay?url=$esc&timeout=5000" -TimeoutSec 180
+    foreach ($p in $raw.PSObject.Properties) {
+      $ms = 0
+      try { $ms = [int]$p.Value } catch { $ms = 0 }
+      if ($ms -gt 0) { $ranked.Add([PSCustomObject]@{ Node = $p.Name; Ms = $ms }) }
+    }
+  } catch { Write-NetEnvLog 'WARN' "GPT 节点轮换：$RankGroup 组测速失败（$_）" }
+
+  $candidates = New-Object System.Collections.Generic.List[string]
+  if ($original -and $original -ne 'DIRECT') { $candidates.Add($original) }
+  # 必须 .ToArray() 再排序：Windows PowerShell 5.1 上 @($genericListOfObject) 会抛
+  # "Argument types do not match"（README「实测坑位」第 1 条），本次首跑就踩了。
+  foreach ($r in ($ranked.ToArray() | Sort-Object Ms)) {
+    if ($candidates.Count -ge $MaxCandidates) { break }
+    if ($candidates -notcontains $r.Node) { $candidates.Add($r.Node) }
+  }
+  if ($candidates.Count -eq 0) {
+    Write-NetEnvLog 'WARN' 'GPT 节点轮换：无候选节点（组测速无结果且当前无选中节点）'
+    return [PSCustomObject]@{ Ok = $false; Node = $null; Detail = 'no-candidates' }
+  }
+
+  foreach ($n in $candidates) {
+    if (-not (Set-NetEnvGptSelectedNode -Node $n -ControllerPort $ControllerPort)) { $tested.Add("$n=switch-failed"); continue }
+    Start-Sleep -Milliseconds 300
+    $p = Test-NetEnvGptEgress -ProbeUrl $ProbeUrl -TimeoutSec $ProbeTimeoutSec
+    if ($p.Ok) {
+      $tested.Add("$n=OK($($p.Status),$($p.Ms)ms)")
+      try {
+        Save-NetEnvTextFile -Path (Join-Path (Get-NetEnvPaths).Data 'gpt-state.json') -Content ([ordered]@{
+          node        = $n
+          verifiedAt  = (Get-Date -Format 's')
+          status      = $p.Status
+          probeUrl    = $ProbeUrl
+        } | ConvertTo-Json)
+      } catch { }
+      # 顶层组指向 gpt-node：轮换只在"探针已失败"之后被调用，此时归位不算跟人工切档打架
+      try {
+        [void](Invoke-NetEnvJsonPut -Uri "$api/proxies/$AdaptiveGroup" -Json (@{ name = $Group } | ConvertTo-Json) -TimeoutSec 10)
+      } catch { }
+      return [PSCustomObject]@{ Ok = $true; Node = $n; Detail = ($tested.ToArray() -join ', ') }
+    }
+    $tested.Add("$n=$($p.Reason)")
+  }
+  # 全部失败 → 还原原节点，别把系统留在"未验证"状态
+  if ($original) { [void](Set-NetEnvGptSelectedNode -Node $original -ControllerPort $ControllerPort) }
+  return [PSCustomObject]@{ Ok = $false; Node = $null; Detail = ($tested.ToArray() -join ', ') }
+}
+
 function Update-NetEnvMihomoConfig {
   # 让运行中的 mihomo 重载配置（走 external-controller，不重启进程、不断监听）。
   # 为什么必须有这一步：nodes refresh 只重写 data/merged.yaml，而 supervisor.ps1 仅在

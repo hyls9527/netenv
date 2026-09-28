@@ -66,6 +66,19 @@
   7-Zip 用 `a -t7z -p<pw> -mhe=on`；Bandizip 用 `a -fmt:7z -p:<pw>`（其 7z 加密头默认开启，实测无密码无法列出条目名）。
 - **代理端口在听但打不开网页**：先跑 `netenv doctor`，看 `端到端出品（经代理实测）` 这一项。
   它走真实请求，能区分"进程活着"与"出口可用"；`data/health-state.json` 记录连续失败次数。
+- **ChatGPT 提示"地区不支持" / `unsupported_country_region_territory`，而其它网站一切正常**：
+  出口节点落在 OpenAI **不支持地区**（免费池里大量香港/澳门节点）。这类故障的特点是**所有连通性判据都是绿的**：
+  端口在听、google 204、github 200，连 `chatgpt.com` 的 TLS 握手都成功 —— 封锁发生在**应用层 403**。
+  - 诊断：`netenv doctor` 看 `GPT 可达性（经代理）`；或直接
+    `curl -s -A "Mozilla/5.0" -x http://127.0.0.1:7897 https://api.openai.com/v1/models`
+    （**401 = 地区受支持、仅缺密钥**；403 + `unsupported_country_region_territory` = 地区封锁）。
+  - 处置：`supervisor-loop` 的 GPT 专项探针会自动轮换 `gpt-node`（`data/gpt-state.json` 记录已验证节点，
+    reload 后每轮自动重放）。手工立即轮换：`. .\lib\core.ps1; Invoke-NetEnvGptNodeRotation`（需
+    `powershell -ExecutionPolicy Bypass`）。
+  - ⚠️ **不要用"延迟最低"挑 GPT 节点**：mihomo 的 `/delay` 不判状态码，香港节点延迟最低却必然 403
+    （实测一次组重测速就把出口从 SG 换成 HK，GPT 立刻从 401 变 403）。`gpt-node` 因此是 select + 轮换，不是 url-test。
+  - 浏览器侧还需系统代理开着：档位得是 `proxy`（`.\netenv.ps1 apply -profile proxy`），否则浏览器直连照样超时
+    （一键脚本：`.\fix-browser-proxy.ps1`）。
 - **浏览器（Edge/Chrome）打不开 GitHub，但同一时刻 `git` / CLI 正常**：这是**档位语义**，不是故障。
   `github` 档 `systemProxy=false`（只注入 git 代理与环境变量），而浏览器吃的是 WinINET 系统代理，
   于是它**直连**被墙目标直到超时（Edge 报 `ERR_CONNECTION_TIMED_OUT`）。

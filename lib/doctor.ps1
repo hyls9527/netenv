@@ -8,6 +8,12 @@ function Invoke-NetEnvDoctor {
   $checks = (New-Object System.Collections.Generic.List[object])
   $script:fails = 0
 
+  # 代理入口一律从端口表派生。此前本文件引用了未定义的 $proxyHostPort（undefined → 空串），
+  # 于是「git 全局代理」的 -match 判据退化成"任何值都匹配"、这一项从不失败；npm 那项则写死了
+  # 7897。两处都改为同一个派生值，改端口时不再漂移。
+  $proxyUrl = Get-NetEnvProxyUrl $cfg
+  $proxyHostPort = $proxyUrl -replace '^https?://', ''
+
   function Add-Check {
     param([string]$Id, [string]$Name, [bool]$Ok, [string]$Detail)
     if (-not $Ok) { $script:fails++ }
@@ -131,7 +137,7 @@ function Invoke-NetEnvDoctor {
   if (Get-Command npm -ErrorAction SilentlyContinue) {
     $npmProxy = npm config get proxy 2>$null
     $npmHttps = npm config get https-proxy 2>$null
-    Add-Check 'npmproxy' 'npm 代理' (($null -eq $npmProxy -or $npmProxy -eq 'null' -or $npmProxy -match '7897') -and ($null -eq $npmHttps -or $npmHttps -eq 'null' -or $npmHttps -match '7897')) ("proxy=$npmProxy https=$npmHttps")
+    Add-Check 'npmproxy' 'npm 代理' (($null -eq $npmProxy -or $npmProxy -eq 'null' -or $npmProxy -match [regex]::Escape($proxyHostPort)) -and ($null -eq $npmHttps -or $npmHttps -eq 'null' -or $npmHttps -match [regex]::Escape($proxyHostPort))) ("proxy=$npmProxy https=$npmHttps")
   } else {
     Add-Check 'npmproxy' 'npm 代理' $true '未安装 npm（跳过）'
   }
@@ -241,9 +247,23 @@ function Invoke-NetEnvDoctor {
     $certUrl = if ($cfg.subscription.githubUrlTest.url) { $cfg.subscription.githubUrlTest.url } else { 'https://github.com/robots.txt' }
     $cert = Test-NetEnvEgress -ProbeUrl $certUrl -TimeoutSec 10 -VerifyCert
     Add-Check 'certverify' '出口证书可信（非 MITM）' $cert.Ok $(if ($cert.Ok) { "HTTP $($cert.Status) in $($cert.Ms)ms（证书有效）" } else { "证书校验失败: $($cert.Error)（换节点或走 DIRECT；见 docs/TROUBLESHOOTING.md）" })
+    # GPT 可达性：判据用**真实响应码**而非"能连上就算通"。免费节点里有大量香港节点，
+    # 对 OpenAI 属**不受支持地区**：TCP/TLS 与 Cloudflare 边缘全通，chatgpt.com 却应用层 403
+    # —— 实测 mihomo 的 /delay 对 401/403 一律返回正延迟，所以任何"延迟选点"都发现不了它。
+    # 验收用 -Attempts 3：免费出口偶发 520/超时，一次性验收不该被单次抖动判死
+    # （自愈循环刻意保持默认 1 次，它的容错在"连续 N 轮失败"上）。
+    $gpt = Test-NetEnvGptEgress -TimeoutSec 12 -Attempts 3
+    Add-Check 'gpt' 'GPT 可达性（经代理）' $gpt.Ok $(if ($gpt.Ok) {
+      "HTTP $($gpt.Status) in $($gpt.Ms)ms ($($gpt.Url)；401=地区受支持、仅缺密钥)"
+    } elseif ("$($gpt.Reason)" -eq 'region-unsupported') {
+      '地区不受支持：需换节点（supervisor-loop 会按地区判据自动轮换 gpt-node；见 docs/TROUBLESHOOTING.md）'
+    } else {
+      "不可达（$($gpt.Reason)；HTTP $($gpt.Status)）"
+    })
   } else {
     Add-Check 'egress' '端到端出品（经代理实测）' $true 'mihomo 未监听，跳过'
     Add-Check 'certverify' '出口证书可信（非 MITM）' $true 'mihomo 未监听，跳过'
+    Add-Check 'gpt' 'GPT 可达性（经代理）' $true 'mihomo 未监听，跳过'
   }
 
   if ($Json) {

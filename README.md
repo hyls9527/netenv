@@ -44,6 +44,17 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   ⚠️ **知情选择：可用性优先，等于接受凭据流量经免费节点**（TLS 仍端到端加密，但出口节点可见目标元数据）；回退步骤见 [docs/GITHUB-SAFETY.md](docs/GITHUB-SAFETY.md)。
 - **`github-adaptive` 组的选点依据必须是 github 自身端点**，默认 `https://github.com/robots.txt`，可由 `config/netenv.json` 的 `subscription.githubUrlTest.url` 覆盖。
   用 `google/gstatic` 之类的通用 URL 会得出错误结论 —— 节点能通 google 不代表能通 github（实测同一时刻 DIRECT 探活 504 而节点 921 ms）。
+- **GPT 长期可达（地区判据，不能只按延迟选点）**：`chatgpt.com` / `openai.com` / `oaistatic.com` / `oaiusercontent.com` /
+  `chatgpt.livekit.cloud` 统一交给 `gpt-adaptive` 组（组内 `gpt-node` / `proxy-select` / `DIRECT`）。
+  ⚠️ **不能沿用通用组"按延迟选点"**：实测 mihomo 的 `/delay` 只看连通、不看状态码（`api.openai.com` 的 401/403、
+  `chatgpt.com` 的 403 挑战都返回**正延迟**），于是延迟最低的香港节点必被选中 —— 而香港是 OpenAI **不支持地区**，
+  症状是 TCP/TLS 全通、`api.openai.com` 却返回 `unsupported_country_region_territory`。
+  实测同一次重测速就把出口从 SG（401 可用）换成 HK（403 不可用）。
+  因此 `gpt-node` 是 **select 而非 url-test**：由 `supervisor-loop` 的 GPT 专项探针用**真实响应码**逐个复测候选
+  （200/401/429=可达；403=不可达，并区分是否地区封锁），第一个通过者胜出并写入 `data/gpt-state.json`，
+  每轮重放（mihomo 重载后 select 组会回到默认成员）。
+  ⚠️ 控制器 JSON 不带 charset，**节点名含 emoji**：PS 5.1 的 `Invoke-WebRequest` 会按 ISO-8859-1 解码成乱码，
+  再拿去选节点必然匹配不到 —— 涉及节点名的控制器调用一律走 `Get-NetEnvJsonUtf8` / `Invoke-NetEnvJsonPut`。
 - **敏感域名直连**：`sensitiveDomains + githubAuthDomains` 生成 `DOMAIN-SUFFIX,<domain>,DIRECT` 规则。
   ⚠️ **同一域名不得同时出现在直连列表与 `githubAdaptiveDomains`**：DIRECT 规则在前会胜出，自适应规则永远不可达（曾是真实缺陷）。
 - **订阅仅 HTTPS**，剥离 `script` 等危险字段；订阅 URL 存 Windows 凭据管理器，不入盘
@@ -69,6 +80,13 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   - **为什么恢复动作不是刷订阅**：`github-adaptive` 组是 `lazy: true`（没流量就不测速），一旦某轮被判定
     `alive:false` 就再没有流量进来、也就永远不再测速，坏状态被**冻结**；而组内节点其实健康
     （同一次测速实测 `github-node` 595ms / `proxy-select` 686ms）。触发一次组测速即恢复，代价远低于刷订阅。
+- **GPT 专项探针（判据独立，且带"地区"语义）**：`health.gptProbe` 为真时 `supervisor-loop` 每轮**单独**探
+  `https://api.openai.com/v1/models`，连败 `gptProbe.failThreshold` 次即按地区判据轮换 `gpt-node`
+  （`Invoke-NetEnvGptNodeRotation`：先按 `auto-urltest` 全池延迟取前 N 个候选，再逐个用真实响应码复测），
+  复测通过记 INFO，`recoverMinIntervalMinutes` 负责退避。
+  - **为什么不能并进 `health.probeUrls` 的 OR 判据**：google 通只说明"能上网"，与 OpenAI 是否接受该出口地区无关；
+    OR 判据下"google 正常但 GPT 全废"不会触发任何自愈（与 github 专项探针同一类盲区）。
+  - **为什么恢复动作是轮换节点而不是刷订阅**：地区不受支持是**节点属性**，刷订阅换一批节点照样可能全是香港。
 - **系统代理漂移自愈**：`supervisor-loop` 每轮比对 WinINET 实际值与当前档位期望值并重写（5 分钟退避）。
   必要性：第三方 VPN / 代理客户端连接时会接管系统代理，而**进程探活与出品探针都发现不了** ——
   端口照样 LISTEN、经隧道探针照样通，吃系统代理的程序却已全部退回直连（典型的"全绿着坏"）。
