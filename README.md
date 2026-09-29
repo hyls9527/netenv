@@ -84,6 +84,15 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   `https://api.openai.com/v1/models`，连败 `gptProbe.failThreshold` 次即按地区判据轮换 `gpt-node`
   （`Invoke-NetEnvGptNodeRotation`：先按 `auto-urltest` 全池延迟取前 N 个候选，再逐个用真实响应码复测），
   复测通过记 INFO，`recoverMinIntervalMinutes` 负责退避。
+  ⚠️ **`gptProbe.failThreshold` 默认取 1（2026-09-29 实测后收紧）**：免费节点会**闪断** ——
+  实测 11:35 钉住的 `hysteria2-1232696196` 在 11:58 单次探针失败后进入"待判窗"，
+  要再等一个探针周期（5 分钟）才够 2 次失败触发轮换，而**用户正好卡在这 5 分钟里**（12:00 报"GPT 卡住"，
+  12:03:50 才重放/轮换）。因此 GPT 单次失败即轮换，`recoverMinIntervalMinutes` 由 10 收到 5
+  （轮换内的全池测速不便宜，靠退避防止硬锤）。副作用：单次抖动也切节点，换来的是"卡顿窗口 ≈ 探针周期"。
+  ⚠️ **loop 只在启动时读一次配置**：`supervisor-loop.ps1` 在进程启动时把 `health.*` 解析成变量，之后不再重读；
+  改完 `config/netenv.json` 里的阈值/退避必须**重启自愈循环**才生效（`Stop-Process` 掉旧实例即可，
+  计划任务 `NetEnv-Supervisor-Periodic` 每 5 分钟会以新配置拉起；该任务以 `RunLevel=Highest` 运行，
+  非提权会话杀不掉它，这是实测踩过的坑）。
   - **为什么不能并进 `health.probeUrls` 的 OR 判据**：google 通只说明"能上网"，与 OpenAI 是否接受该出口地区无关；
     OR 判据下"google 正常但 GPT 全废"不会触发任何自愈（与 github 专项探针同一类盲区）。
   - **为什么恢复动作是轮换节点而不是刷订阅**：地区不受支持是**节点属性**，刷订阅换一批节点照样可能全是香港。

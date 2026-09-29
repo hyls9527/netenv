@@ -536,8 +536,12 @@ Describe 'GPT 专项（长期可访问）' {
     $cfg.health.gptProbe | Should Not BeNullOrEmpty
     @($cfg.health.gptProbe.probeUrls).Count | Should BeGreaterThan 0
     $cfg.health.gptProbe.probeUrls[0] | Should Match 'api\.openai\.com'
-    [int]$cfg.health.gptProbe.failThreshold | Should BeGreaterThan 0
+    # 阈值必须为 1（2026-09-29 实测：钉住的节点闪断后，单次失败到下次探针之间有约 5 分钟的
+    # "待判窗"，用户正好卡在里面 —— 12:00 报卡、12:03:50 才轮换）。取 2 等于故意留这个窗口。
+    [int]$cfg.health.gptProbe.failThreshold | Should Be 1
+    # 退避收敛到 5 分钟（与探针周期同量级）：轮换内含全池测速，不能没有下限地硬锤
     [int]$cfg.health.gptProbe.recoverMinIntervalMinutes | Should BeGreaterThan 0
+    [int]$cfg.health.gptProbe.recoverMinIntervalMinutes | Should BeLessThan 11
     [int]$cfg.health.gptProbe.maxCandidates | Should BeGreaterThan 0
     $cfg.health.gptProbe.group | Should Be 'gpt-adaptive'
     $cfg.health.gptProbe.rotateGroup | Should Be 'gpt-node'
@@ -581,6 +585,35 @@ Describe 'GPT 专项（长期可访问）' {
       $m.Groups[1].Value | Should Match $k
     }
   }
+
+  It '首次失败即轮换：配置必须是 1，且 loop 的轮换判据确实挂在 failThreshold 上' {
+    # 背景（2026-09-29 实测）：钉住的节点闪断后，探针第 1 次失败只记 WARN，第 2 次才轮换 ——
+    # 两次之间隔着 5 分钟探针周期，用户正好卡在窗口里（12:00 报卡、12:03:50 才轮换）。
+    # 治法是配置取 1；同时守住"轮换判据必须读该字段"，否则把配置改回 2 会悄悄退化成旧行为。
+    $cfg = Read-NetEnvConfig
+    [int]$cfg.health.gptProbe.failThreshold | Should Be 1
+    $loop = Read-NetEnvFileText (Join-Path $root 'lib\supervisor-loop.ps1')
+    # 阈值来自配置（不是写死）：解析赋值语句
+    $loop | Should Match 'if \(\$tp\.failThreshold\) \{ \$gptFailThreshold = \[int\]\$tp\.failThreshold \}'
+    # 轮换分支必须由"连败 >= 阈值"把关，且判据里读的是 $gptFailThreshold
+    $loop | Should Match '\$st\.gptConsecutiveFail -ge \$gptFailThreshold'
+    $loop | Should Match 'Invoke-NetEnvGptNodeRotation'
+    # 单次失败就要进轮换：失败计数自增后紧跟着阈值判定（中间不得再插入"至少 2 次"之类的条件）
+    $incIdx = $loop.IndexOf('$st.gptConsecutiveFail = [int]$st.gptConsecutiveFail + 1')
+    $thrIdx = $loop.IndexOf('if ([int]$st.gptConsecutiveFail -ge $gptFailThreshold) {')
+    ($incIdx -ge 0) | Should Be $true
+    ($thrIdx -gt $incIdx) | Should Be $true
+  }
+    # 用真 core.ps1 解析影子配置（只认键，不碰网络）；root 指向影子目录，避免污染其他用例
+    $shadowDir = Join-Path $env:TEMP ('netenv-shadow-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $shadowDir 'config'), (Join-Path $shadowDir 'lib') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'lib\core.ps1') -Destination (Join-Path $shadowDir 'lib\core.ps1') -Force
+    $shadowCfg = (Read-NetEnvFileText (Join-Path $root 'config\netenv.json')) -replace '"mode"\s*:\s*"portable"', '"mode": "installed"'
+    [System.IO.File]::WriteAllText((Join-Path $shadowDir 'config\netenv.json'), $shadowCfg, (New-Object System.Text.UTF8Encoding($false)))
+    $corePath = (Resolve-Path (Join-Path $shadowDir 'lib\core.ps1')).Path
+    $gotCfg = & (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -Command ". '$corePath'; (Read-NetEnvConfig -Quiet).health.gptProbe.failThreshold"
+    ([string]$gotCfg).Trim() | Should Be '1'
+    Remove-Item -LiteralPath $shadowDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Describe '日志函数健壮性' {

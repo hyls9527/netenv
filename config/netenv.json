@@ -41,12 +41,12 @@
                                     "probeUrls":  [
                                                       "https://api.openai.com/v1/models"
                                                   ],
-                                    "failThreshold":  2,
+                                    "failThreshold":  1,
                                     "group":  "gpt-adaptive",
                                     "rotateGroup":  "gpt-node",
                                     "rankGroup":  "auto-urltest",
                                     "maxCandidates":  8,
-                                    "recoverMinIntervalMinutes":  10
+                                    "recoverMinIntervalMinutes":  5
                                 }
                },
     "sensitiveDomains":  [
@@ -54,6 +54,7 @@
                              "*.abchina.com",
                              "*.bankofchina.com",
                              "*.ccb.com",
+                             "*.cjzmai.com",
                              "*.cmbchina.com",
                              "*.gmail.com",
                              "*.icbc.com.cn",
@@ -88,6 +89,7 @@
                              "abchina.com",
                              "bankofchina.com",
                              "ccb.com",
+                             "cjzmai.com",
                              "cmbchina.com",
                              "icbc.com.cn",
                              "login.microsoftonline.com",
