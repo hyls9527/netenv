@@ -267,6 +267,40 @@ function Build-NetEnvMergedConfig {
     "      - `"$esc`""
   }
 
+  # 探针专用入口 + 专用节点池。端口缺省时**整块不生成**（含 IN-PORT 规则）：
+  # 老配置没有 ports.mihomoProbe，若照旧往 YAML 里塞一个空端口的 listener，mihomo 会
+  # 直接拒绝加载 —— 那是断网级故障，而不是"少一个优化"。缺端口时行为退回旧路径。
+  $probePort = 0
+  if ($Cfg.ports -and $Cfg.ports.mihomoProbe) { $probePort = [int]$Cfg.ports.mihomoProbe }
+  $probeListenersBlock = ''
+  $probeRuleText = ''
+  $probeGroupsBlock = ''
+  if ($probePort -gt 0) {
+    $probeListenersBlock = @"
+# ---- 探针专用入口（GPT 节点轮换用）----
+# 为什么必须单开一条入口：地区判据只能由**真实响应码**给出，于是轮换必须把候选节点切过去
+# 逐个复测。若切的是线上组（gpt-node，即 7897/7890 入口），正在上网的流量会跟着"尚未验证"
+# 的候选一起走 —— 2026-10-06 16:53 实测：轮换把线上组切到香港候选，用户恰在同一秒打开
+# chatgpt.com，拿到 Cloudflare 的 403 unsupported_country_region_territory「无法加载网站」页。
+# 单开入口后，轮换只动 gpt-probe 组，线上 gpt-node 在整个复测期间纹丝不动，最终只做一次
+# "已通过地区判据"的原子切换。规则侧第一条 IN-PORT 把这条入口整体导向 gpt-probe。
+listeners:
+  - name: gpt-probe
+    type: mixed
+    port: $probePort
+    listen: 127.0.0.1
+"@
+    $probeRuleText = "    - IN-PORT,$probePort,gpt-probe"
+    $probeGroupsBlock = @"
+  # 探针专用节点池：与 gpt-node 同一批节点，但只被探针入口（IN-PORT 规则）使用。
+  # 轮换在这里反复切换候选，线上流量看不到这个过程。
+  - name: gpt-probe
+    type: select
+    proxies:
+$($groupNames -join "`n")
+"@
+  }
+
   $merged = @"
 mixed-port: $($Cfg.ports.mihomoMixed)
 port: $($Cfg.ports.mihomoHttp)
@@ -275,6 +309,7 @@ mode: rule
 log-level: info
 ipv6: false
 external-controller: 127.0.0.1:$($Cfg.ports.mihomoController)
+$probeListenersBlock
 # sniffer：按 TLS SNI / HTTP Host 还原真实域名后再匹配规则。
 # 必要性：本地 DNS 对 github.com / www.google.com 等存在投毒（实测 github.com 被解析到不可达 IP
 # 20.205.243.166，而真实 IP 140.82.112.3 可通），仅靠 IP 分流会判错目标。
@@ -359,6 +394,7 @@ $($groupNames -join "`n")
     type: select
     proxies:
 $($groupNames -join "`n")
+$probeGroupsBlock
   - name: gpt-adaptive
     type: select
     proxies:
@@ -366,6 +402,7 @@ $($groupNames -join "`n")
       - proxy-select
       - DIRECT
 rules:
+$probeRuleText
 $ruleText
 $adaptiveRuleText
 $gptRuleText

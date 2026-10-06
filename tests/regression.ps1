@@ -42,6 +42,17 @@ if ($Live) {
 }
 
 Import-Module Pester
+
+# 前置编码守卫：无 BOM 的 .ps1 在 Windows PowerShell 5.1 下会被按 GBK 解码，中文注释直接
+# 破坏引号配对 —— 表现是整个测试文件 "Missing closing '}'" 之类的假语法错（2026-10-06 实测
+# 自伤过一次：AI 编辑工具剥掉 4 个 lib\*.ps1 的 BOM，生产自愈循环连续 7 分钟报解析错误）。
+# 放在 Pester 之前跑：先给出"哪个文件缺 BOM"的可执行结论，而不是让人去猜语法。
+& $psExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'ensure-bom.ps1') -Check
+if ($LASTEXITCODE -ne 0) {
+  Write-Host 'regression: 中止 —— 存在缺少 UTF-8 BOM 的 .ps1。修法：.\tests\ensure-bom.ps1'
+  exit 1
+}
+
 $testPath = Join-Path $PSScriptRoot 'netenv.tests.ps1'
 # 日志沙箱在用例文件内部（dot-source core.ps1 之后立即生效）—— 这里再做会在
 # dot-source 时被 core.ps1 的 $script:NetEnvRoot 重新覆盖掉，实测无效。

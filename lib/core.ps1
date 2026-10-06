@@ -622,12 +622,84 @@ function Get-NetEnvGptSelectedNode {
 }
 
 function Set-NetEnvGptSelectedNode {
-  # 把 select 组 gpt-node 切到指定节点。失败返回 $false、不抛（自愈循环不得被打断）。
-  param([string]$Node, [int]$ControllerPort = 19090)
+  # 把 select 组切到指定节点。默认 Group=gpt-node（线上组），传 ProbeGroup 则只动探针池。
+  # 失败返回 $false、不抛（自愈循环不得被打断）。
+  param([string]$Node, [int]$ControllerPort = 19090, [string]$Group = 'gpt-node')
   if (-not $Node) { return $false }
+  if (-not $Group) { $Group = 'gpt-node' }
   try {
     # 必须走 UTF-8 PUT：节点名含 emoji，走 Invoke-WebRequest 会以乱码匹配（见上方注释）
-    [void](Invoke-NetEnvJsonPut -Uri "http://127.0.0.1:$ControllerPort/proxies/gpt-node" -Json (@{ name = $Node } | ConvertTo-Json) -TimeoutSec 10)
+    [void](Invoke-NetEnvJsonPut -Uri "http://127.0.0.1:$ControllerPort/proxies/$Group" -Json (@{ name = $Node } | ConvertTo-Json) -TimeoutSec 10)
+    return $true
+  } catch { return $false }
+}
+
+# ---- GPT "地区不受支持"节点名单（data/gpt-blocklist.json）----
+# 为什么值得单独记账：出口地区是**节点的稳定属性** —— 同一个香港节点今天、明天都仍是 OpenAI
+# 不支持地区。旧实现每次轮换都把它重新复测一遍（每个候选最长 20s），2026-10-06 一天就复测了
+# 8 次（logs/20261006.log 里 8 条 hysteria2-1446360527=region-unsupported）。
+# 名单带 TTL 而不是永久拉黑：机场会换出口 IP，同一节点名下的实际地区可能变；
+# 到期自动重试，避免"曾经不行就永远不用"把可用节点永久排除。
+function Get-NetEnvGptBlocklistPath {
+  return (Join-Path (Get-NetEnvPaths).Data 'gpt-blocklist.json')
+}
+
+function Get-NetEnvGptBlocklist {
+  # 返回 @{ 节点名 = 解封时刻[datetime] }，已过期的条目直接不返回。文件缺失/损坏一律返回空表，不抛。
+  $out = @{}
+  try {
+    $f = Get-NetEnvGptBlocklistPath
+    if (-not (Test-Path -LiteralPath $f)) { return $out }
+    $o = (Read-NetEnvFileText $f) | ConvertFrom-Json
+    if (-not $o -or -not $o.entries) { return $out }
+    $now = Get-Date
+    foreach ($p in $o.entries.PSObject.Properties) {
+      $until = $null
+      try { $until = [datetime]$p.Value.until } catch { $until = $null }
+      if ($until -and $until -gt $now) { $out[$p.Name] = $until }
+    }
+  } catch { }
+  return $out
+}
+
+function Save-NetEnvGptBlocklist {
+  param([hashtable]$Entries)
+  # 局部变量不能叫 $entries —— 与参数 $Entries 大小写不敏感同名，会把参数清成空表，
+  # 于是名单永远写成空（2026-10-06 静态扫描抓到，与 $probePort/$ProbePort 同一类错误）。
+  try {
+    $map = [ordered]@{}
+    foreach ($k in @($Entries.Keys)) {
+      $map[[string]$k] = [ordered]@{ reason = 'region-unsupported'; until = ([datetime]$Entries[$k]).ToString('s') }
+    }
+    $payload = [ordered]@{ version = 1; updatedAt = (Get-Date -Format 's'); entries = $map }
+    Save-NetEnvTextFile -Path (Get-NetEnvGptBlocklistPath) -Content ($payload | ConvertTo-Json -Depth 4)
+    return $true
+  } catch { return $false }
+}
+
+function Add-NetEnvGptBlockedNode {
+  # 记一个"地区不受支持"的节点。只应由 region-unsupported 这类**稳定**判据调用；
+  # 超时/520 之类的瞬时故障不得入账（否则会把好节点误伤进名单）。
+  param([string]$Node, [int]$Hours = 12)
+  if (-not $Node) { return $false }
+  if ($Hours -lt 1) { $Hours = 12 }
+  try {
+    $bl = Get-NetEnvGptBlocklist
+    $bl[$Node] = (Get-Date).AddHours($Hours)
+    [void](Save-NetEnvGptBlocklist -Entries $bl)
+    return $true
+  } catch { return $false }
+}
+
+function Remove-NetEnvGptBlockedNode {
+  # 节点复测通过即除名（地区可能已变、或当初是误判）。
+  param([string]$Node)
+  if (-not $Node) { return $false }
+  try {
+    $bl = Get-NetEnvGptBlocklist
+    if (-not $bl.ContainsKey($Node)) { return $false }
+    $bl.Remove($Node)
+    [void](Save-NetEnvGptBlocklist -Entries $bl)
     return $true
   } catch { return $false }
 }
@@ -638,6 +710,14 @@ function Invoke-NetEnvGptNodeRotation {
   # mihomo 测速不看状态码，香港节点延迟最低却对 OpenAI 是不受支持地区。
   # 候选顺序：先复测当前节点（避免无谓切换），再按延迟从快到慢取前 N 个；
   # 第一个通过地区探针的节点胜出并持久化到 data/gpt-state.json（供 reload 后重放）；全部失败则还原。
+  #
+  # 【复测必须在探针专用入口上进行】旧实现每试一个候选就把**线上组** gpt-node 切过去，
+  # 于是整个复测期间所有真实流量（浏览器、ChatGPT 桌面端）都在跟着"尚未验证"的候选走。
+  # 2026-10-06 16:53 实测后果：16:53:07 探针连败触发轮换 → 16:53:27 用户打开 chatgpt.com，
+  # 流量正走香港候选 → Cloudflare 返回 403 unsupported_country_region_territory，
+  # 页面显示「无法加载网站 / 如果你用的是VPN，试着关闭它」（logs/20261006.log:226-234）。
+  # 现在复测只在 ProbeGroup（探针池）上进行、经 ProbePort 出网，线上组**一次都不动**，
+  # 直到某个候选真的通过地区判据，才做一次原子切换；一个都没通过就完全不切。
   param(
     [string]$Group = 'gpt-node',
     [string]$AdaptiveGroup = 'gpt-adaptive',
@@ -646,10 +726,31 @@ function Invoke-NetEnvGptNodeRotation {
     [string]$RankGroup = 'auto-urltest',
     [int]$ControllerPort = 19090,
     [int]$MaxCandidates = 8,
-    [int]$ProbeTimeoutSec = 10
+    [int]$ProbeTimeoutSec = 10,
+    [string]$ProbeGroup = '',
+    [int]$ProbePort = 0,
+    [int]$BlocklistHours = 0,
+    [int]$RankRetryTimeoutMs = 15000,
+    [int]$PoolScanMax = 40,
+    [int]$PoolScanTimeoutSec = 4,
+    [int]$PoolScanBudgetSec = 120,
+    [int]$PoolScanSeed = 0
   )
   $api = "http://127.0.0.1:$ControllerPort"
   $tested = New-Object System.Collections.Generic.List[string]
+
+  # 参数缺省时从配置补齐（手工 `Invoke-NetEnvGptNodeRotation` 调用不带参也能享受到隔离通道）
+  $rc = $null
+  try { $rc = Read-NetEnvConfig -Quiet } catch { $rc = $null }
+  if (-not $ProbeGroup) {
+    if ($rc -and $rc.health -and $rc.health.gptProbe -and $rc.health.gptProbe.probeGroup) { $ProbeGroup = [string]$rc.health.gptProbe.probeGroup }
+    else { $ProbeGroup = 'gpt-probe' }
+  }
+  if ($ProbePort -le 0 -and $rc -and $rc.ports -and $rc.ports.mihomoProbe) { $ProbePort = [int]$rc.ports.mihomoProbe }
+  if ($BlocklistHours -le 0) {
+    if ($rc -and $rc.health -and $rc.health.gptProbe -and $rc.health.gptProbe.blocklistHours) { $BlocklistHours = [int]$rc.health.gptProbe.blocklistHours }
+    else { $BlocklistHours = 12 }
+  }
   try {
     $proxies = Get-NetEnvJsonUtf8 -Uri "$api/proxies" -TimeoutSec 10
   } catch {
@@ -663,6 +764,33 @@ function Invoke-NetEnvGptNodeRotation {
   }
   $original = [string]$entry.Value.now
 
+  # ---- 复测通道解析与降级 ----
+  # 三条同时成立才算隔离通道可用：① 探针端口已配且真的在听；② 探针组存在于运行中的配置里。
+  # 任一条不成立就退回"切线上组"的旧路径并记 WARN —— 配置没跟上时（例如运行中的 merged.yaml
+  # 还是改动前生成的、里面没有 gpt-probe 组），宁可保留会打扰用户的老行为，
+  # 也不能让自愈直接失效。
+  # 注意：局部变量**不能**叫 $probePort —— PowerShell 变量名不区分大小写，它会和参数
+  # $ProbePort 是同一个变量，一句 $probePort = 0 就把参数清零，隔离判断永远为假。
+  # （2026-10-06 隔离运行时验证首跑抓到：日志里打印"端口 0"，线上组真的被切了一路。）
+  $switchGroup = $Group
+  $egressPort = 0
+  $probeIsolated = $false
+  if ($ProbePort -gt 0 -and $proxies.proxies.PSObject.Properties[$ProbeGroup]) {
+    try {
+      $tcp = New-Object System.Net.Sockets.TcpClient
+      $tcp.Connect('127.0.0.1', $ProbePort)
+      $tcp.Close()
+      $probeIsolated = $true
+    } catch { $probeIsolated = $false }
+  }
+  if ($probeIsolated) {
+    $switchGroup = $ProbeGroup
+    $egressPort = $ProbePort
+  } else {
+    Write-NetEnvLog 'WARN' ("GPT 节点轮换：探针专用入口不可用（组 $ProbeGroup / 端口 $ProbePort）→ " +
+      '退回切线上组的旧路径，复测期间线上流量会跟着未验证的候选走（执行 nodes refresh 可生成 gpt-probe 入口）')
+  }
+
   $ranked = New-Object System.Collections.Generic.List[object]
   try {
     $esc = [System.Uri]::EscapeDataString($LatencyUrl)
@@ -674,25 +802,138 @@ function Invoke-NetEnvGptNodeRotation {
     }
   } catch { Write-NetEnvLog 'WARN' "GPT 节点轮换：$RankGroup 组测速失败（$_）" }
 
-  $candidates = New-Object System.Collections.Generic.List[string]
-  if ($original -and $original -ne 'DIRECT') { $candidates.Add($original) }
+  # 组测速是"并行但会丢"的预筛：只回传在 timeout 内响应的成员，5s 对跨境免费节点偏紧。
+  # 2026-10-06 17:50 实测整组测速 504（零候选）→ 自愈明明有一个池子却换不动。
+  # 首次无结果时放宽一次（仍是并行的，代价只有一次往返），拿到的候选越全，
+  # 越不需要往下走"全池顺序扫描"那条更慢的路。
+  if ($ranked.Count -eq 0 -and $RankRetryTimeoutMs -gt 0) {
+    try {
+      $esc = [System.Uri]::EscapeDataString($LatencyUrl)
+      $raw2 = Get-NetEnvJsonUtf8 -Uri "$api/group/$RankGroup/delay?url=$esc&timeout=$RankRetryTimeoutMs" -TimeoutSec 180
+      foreach ($p in $raw2.PSObject.Properties) {
+        $ms = 0
+        try { $ms = [int]$p.Value } catch { $ms = 0 }
+        if ($ms -gt 0) { $ranked.Add([PSCustomObject]@{ Node = $p.Name; Ms = $ms }) }
+      }
+      if ($ranked.Count -gt 0) {
+        Write-NetEnvLog 'INFO' "GPT 节点轮换：$RankGroup 首次测速无结果，放宽到 $($RankRetryTimeoutMs)ms 后取到 $($ranked.Count) 个候选"
+      }
+    } catch {
+      Write-NetEnvLog 'WARN' "GPT 节点轮换：$RankGroup 放宽超时重测仍失败（$_）"
+    }
+  }
+
   # 必须 .ToArray() 再排序：Windows PowerShell 5.1 上 @($genericListOfObject) 会抛
   # "Argument types do not match"（README「实测坑位」第 1 条），本次首跑就踩了。
-  foreach ($r in ($ranked.ToArray() | Sort-Object Ms)) {
+  $rankedSorted = @($ranked.ToArray() | Sort-Object Ms)
+
+  $candidates = New-Object System.Collections.Generic.List[string]
+  $skippedBlocked = New-Object System.Collections.Generic.List[string]
+  $blocked = Get-NetEnvGptBlocklist
+  # 当前节点总是第一个复测（且不受名单限制）：它可能就是被瞬时抖动误判的，先探它能避免
+  # "本不该切却切了"—— 探针只失败一次（failThreshold=1）就进来的，这一步收益最高。
+  if ($original -and $original -ne 'DIRECT') { $candidates.Add($original) }
+  foreach ($r in $rankedSorted) {
     if ($candidates.Count -ge $MaxCandidates) { break }
-    if ($candidates -notcontains $r.Node) { $candidates.Add($r.Node) }
+    if ($candidates -contains $r.Node) { continue }
+    if ($blocked.ContainsKey($r.Node)) {
+      if ($skippedBlocked -notcontains $r.Node) { $skippedBlocked.Add($r.Node) }
+      continue
+    }
+    $candidates.Add($r.Node)
+  }
+  if ($skippedBlocked.Count -gt 0) {
+    Write-NetEnvLog 'INFO' "GPT 节点轮换：跳过 $($skippedBlocked.Count) 个已知地区不受支持节点（$($skippedBlocked.ToArray() -join ', ')）"
+  }
+  # 全池都进了名单（或测速无结果）：名单是提示不是闸门，忽略它重来一遍。
+  # 否则名单一旦写坏就会退化成"永远无候选"，自愈能力直接归零。
+  if ($candidates.Count -eq 0) {
+    foreach ($r in $rankedSorted) {
+      if ($candidates.Count -ge $MaxCandidates) { break }
+      if ($candidates -notcontains $r.Node) { $candidates.Add($r.Node) }
+    }
+    if ($candidates.Count -gt 0) {
+      Write-NetEnvLog 'WARN' "GPT 节点轮换：候选全在地区名单内（$($skippedBlocked.ToArray() -join ', ')），已忽略名单重试"
+    }
+  }
+  # ---- 全池兜底扫描 ----
+  # 为什么需要：上面的候选只来自 $RankGroup 的**一次并行测速**，它可能只回传极少数成员
+  # （2026-10-06 17:34：整个池子只有 1 个节点响应，偏偏还是地区封锁的香港节点），
+  # 也可能整组 504、零候选（同一天 17:50 → 自愈有池子却换不动）。这两种情况下都别急着放弃：
+  # 池子里还有几百个没被预筛命中的节点，按顺序经**探针入口**逐个验一遍，成本可控
+  # （单点 4s、总预算 120s，且只在预筛候选全部失败之后才真正花这笔钱）。
+  # 只允许在隔离通道上做：退路模式下每试一个都会把线上组切走，全池扫一遍等于把用户扔进海选。
+  $rankedCandidateCount = $candidates.Count
+  $poolScanArmed = $false
+  if ($probeIsolated -and $PoolScanMax -gt 0) {
+    $allMembers = @()
+    try { $allMembers = @($proxies.proxies.PSObject.Properties[$switchGroup].Value.all) } catch { $allMembers = @() }
+    if ($allMembers.Count -gt 0) {
+      $poolScanArmed = $true
+      # 每次轮换从池子的不同位置开始，否则前 N 个节点会被反复复测、后面的永远轮不到。
+      # 5.1 下用 System.Random + Fisher-Yates 自己洗牌；种子默认取当前时钟，也可显式指定以便复现。
+      $seed = $PoolScanSeed
+      if ($seed -le 0) { $seed = [int](Get-Date -Format 'HHmmss') }
+      $rnd = New-Object System.Random($seed)
+      $shuffled = New-Object System.Collections.ArrayList
+      foreach ($m in $allMembers) { [void]$shuffled.Add([string]$m) }
+      for ($i = $shuffled.Count - 1; $i -gt 0; $i--) {
+        $j = $rnd.Next($i + 1)
+        $tmp = $shuffled[$i]; $shuffled[$i] = $shuffled[$j]; $shuffled[$j] = $tmp
+      }
+      $scanAdded = 0
+      $scanSkippedBlocked = 0
+      foreach ($m in $shuffled) {
+        if ($scanAdded -ge $PoolScanMax) { break }
+        if (-not $m -or $m -eq 'DIRECT' -or $m -eq 'REJECT' -or $m -eq 'GLOBAL') { continue }
+        if ($candidates -contains $m) { continue }
+        if ($blocked.ContainsKey($m)) { $scanSkippedBlocked++; continue }
+        [void]$candidates.Add($m)
+        $scanAdded++
+      }
+      Write-NetEnvLog 'INFO' ("GPT 节点轮换：追加全池兜底扫描 $scanAdded 个（池 $($allMembers.Count)" +
+        " / 跳过地区名单 $scanSkippedBlocked / 单点超时 $($PoolScanTimeoutSec)s / 预算 $($PoolScanBudgetSec)s）")
+    }
   }
   if ($candidates.Count -eq 0) {
     Write-NetEnvLog 'WARN' 'GPT 节点轮换：无候选节点（组测速无结果且当前无选中节点）'
     return [PSCustomObject]@{ Ok = $false; Node = $null; Detail = 'no-candidates' }
   }
 
+  $probeIdx = 0
+  $scanDeadline = $null
+  if ($poolScanArmed -and $PoolScanBudgetSec -gt 0) { $scanDeadline = (Get-Date).AddSeconds($PoolScanBudgetSec) }
   foreach ($n in $candidates) {
-    if (-not (Set-NetEnvGptSelectedNode -Node $n -ControllerPort $ControllerPort)) { $tested.Add("$n=switch-failed"); continue }
+    $probeIdx++
+    # 兜底扫描段单独计时：预筛候选（前 $rankedCandidateCount 个）不设预算，它们本来就只有几个。
+    $inPoolScan = ($poolScanArmed -and $probeIdx -gt $rankedCandidateCount)
+    if ($inPoolScan -and $scanDeadline -and (Get-Date) -gt $scanDeadline) {
+      $tested.Add('pool-scan=budget-exhausted')
+      Write-NetEnvLog 'WARN' "GPT 节点轮换：全池兜底扫描预算 $($PoolScanBudgetSec)s 用尽（已试 $($probeIdx - 1) 个）仍无可用节点"
+      break
+    }
+    if (-not (Set-NetEnvGptSelectedNode -Node $n -ControllerPort $ControllerPort -Group $switchGroup)) { $tested.Add("$n=switch-failed"); continue }
     Start-Sleep -Milliseconds 300
-    $p = Test-NetEnvGptEgress -ProbeUrl $ProbeUrl -TimeoutSec $ProbeTimeoutSec
+    # 隔离通道上经 egressPort 出网（走 IN-PORT → gpt-probe）；退回旧路径时 $egressPort=0，
+    # 则 Test-NetEnvGptEgress 按配置回落到线上端口，与旧行为一致。
+    # 兜底扫描段用更短的超时：池子越大越要控单点成本 —— 与其在一个死节点上耗 10s，
+    # 不如多试几个（死节点/被墙节点几乎都是"超时"而不是"快速拒绝"）。
+    $probeTimeout = $ProbeTimeoutSec
+    if ($inPoolScan -and $PoolScanTimeoutSec -gt 0 -and $PoolScanTimeoutSec -lt $ProbeTimeoutSec) { $probeTimeout = $PoolScanTimeoutSec }
+    $p = Test-NetEnvGptEgress -ProbeUrl $ProbeUrl -TimeoutSec $probeTimeout -ProxyPort $egressPort
     if ($p.Ok) {
       $tested.Add("$n=OK($($p.Status),$($p.Ms)ms)")
+      # 到这里候选才第一次接触线上：$n 已通过地区判据，切换是原子的。
+      # 隔离通道下 $switchGroup 是探针组，线上组从头到尾没被动过，必须显式切过去（并确认成功）。
+      if ($switchGroup -ne $Group) {
+        if (Set-NetEnvGptSelectedNode -Node $n -ControllerPort $ControllerPort -Group $Group) {
+          $tested.Add('live-switch=OK')
+        } else {
+          $tested.Add('live-switch=FAILED')
+          Write-NetEnvLog 'WARN' "GPT 节点轮换：$n 已通过地区判据，但切换到线上组 $Group 失败"
+        }
+      }
+      [void](Remove-NetEnvGptBlockedNode -Node $n)
       try {
         Save-NetEnvTextFile -Path (Join-Path (Get-NetEnvPaths).Data 'gpt-state.json') -Content ([ordered]@{
           node        = $n
@@ -708,9 +949,13 @@ function Invoke-NetEnvGptNodeRotation {
       return [PSCustomObject]@{ Ok = $true; Node = $n; Detail = ($tested.ToArray() -join ', ') }
     }
     $tested.Add("$n=$($p.Reason)")
+    # 只对"地区不受支持"记账：它由响应码给出、是节点的稳定属性；超时/520 是瞬时故障，
+    # 记进名单会把好节点误伤（下次轮换直接跳过它）。
+    if ($p.Reason -eq 'region-unsupported') { [void](Add-NetEnvGptBlockedNode -Node $n -Hours $BlocklistHours) }
   }
-  # 全部失败 → 还原原节点，别把系统留在"未验证"状态
-  if ($original) { [void](Set-NetEnvGptSelectedNode -Node $original -ControllerPort $ControllerPort) }
+  # 全部失败 → 还原。走隔离通道时线上组**从未被改过**，这里还原的是探针组（保持整洁）；
+  # 走退路时线上组被切了一路，必须显式还原，别把系统留在"未验证"状态。
+  if ($original) { [void](Set-NetEnvGptSelectedNode -Node $original -ControllerPort $ControllerPort -Group $switchGroup) }
   return [PSCustomObject]@{ Ok = $false; Node = $null; Detail = ($tested.ToArray() -join ', ') }
 }
 

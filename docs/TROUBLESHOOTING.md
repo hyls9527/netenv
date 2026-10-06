@@ -88,6 +88,60 @@
     `powershell -ExecutionPolicy Bypass`）。
   - ⚠️ **不要用"延迟最低"挑 GPT 节点**：mihomo 的 `/delay` 不判状态码，香港节点延迟最低却必然 403
     （实测一次组重测速就把出口从 SG 换成 HK，GPT 立刻从 401 变 403）。`gpt-node` 因此是 select + 轮换，不是 url-test。
+  - ⚠️ **页面报「无法加载网站 / 请稍后再试。如果你用的是VPN，试着关闭它」**：这是 `chatgpt.com` 返回的
+    **应用层拦截页**（HTML 外壳照常渲染、页脚带 `[IP: <出口> | 雷ID: <Cloudflare Ray ID>]`），
+    与"节点连不上"是两回事 —— 连通性判据全绿也会长这样。先查那个 IP 是谁：
+    `curl -s -x http://127.0.0.1:7897 https://chatgpt.com/cdn-cgi/trace` 给出当前出口的 `ip=` / `loc=`，
+    再对照 OpenAI 支持地区。**页面上的 IP 只是"报错那一刻"的出口，不代表现在的出口** ——
+    2026-10-06 实测页面显示 `212.192.15.177`（香港 AS26383、`proxy=true`），几分钟后 `loc` 已回到 FR，
+    因为轮换窗口结束、线上组被还原了。
+  - ⚠️ **现象若是"偶发、几秒后自己恢复"，先怀疑轮换本身，而不是节点抖动**：GPT 专项探针连败即触发
+    `Invoke-NetEnvGptNodeRotation`，而**修复前**的实现是把**线上组** `gpt-node` 逐个候选切过去复测 ——
+    复测窗口内用户真实流量全程跟着候选走。2026-10-06 16:53:07 探针连败 → 16:53:27 用户打开 `chatgpt.com`
+    正好落在窗口里 → 香港候选返回地区拦截 → 16:53:32 轮换失败还原。现在复测走**独立探针入口**
+    （`ports.mihomoProbe`，默认 `7898`；`rules` 首条 `IN-PORT,<port>,gpt-probe` → select 组 `gpt-probe`），
+    线上组只在候选**真的通过地区判据**之后做一次原子切换。
+    - 隔离自检：日志出现 `GPT 节点轮换：探针专用入口不可用（组 gpt-probe / 端口 0）→ 退回切线上组的旧路径`
+      即说明隔离**未生效**（配置缺 `ports.mihomoProbe` / `health.gptProbe.probeGroup`，或 `merged.yaml` 改完没重载）。
+    - 绑定自检（**必须用"出口 IP"判，不能用"某站点通不通"判**）：把两个组临时钉到不同节点，再看两个入口的出口是否不同 ——
+      ```
+      curl -s -X PUT http://127.0.0.1:19090/proxies/gpt-probe -d '{"name":"<池里另一个节点>"}' -H "Content-Type: application/json"
+      curl -s -x http://127.0.0.1:7897 https://chatgpt.com/cdn-cgi/trace   # 线上组出口
+      curl -s -x http://127.0.0.1:7898 https://chatgpt.com/cdn-cgi/trace   # 探针组出口
+      ```
+      两者 `ip=` **必须不同**（2026-10-06 实测：`gpt-node=trojan-1681917898/jp` 时 7897 回 `ip=45.32.52.173 colo=NRT loc=JP`，
+      `gpt-probe` 换成中国节点后 7898 直接失败；还原后 7898 再回 JP）。相同就说明 `IN-PORT` 没生效，
+      最常见原因是它没有排在 `rules` **最前面**；端口根本连不上（`curl: (7) Failed to connect`）则说明
+      `listeners` 里没有该入口，也就是 `merged.yaml` 改完没重载。
+      ⚠️ **别用 `https://www.baidu.com/` 当判据**：探针出口是境外节点，baidu 从境外照样能 200，
+      于是"7898 该失败却回 200"的假警报会出现（本文件早期版本就写错过这条）。
+  - **被判定 `region-unsupported` 的节点会进 `data/gpt-blocklist.json`**（TTL = `gptProbe.blocklistHours`，默认 12 小时），
+    轮换挑候选时直接剔除：地区封锁是**节点属性**，不会自己恢复（实测一天内同一香港节点被重复复测 8 次）。
+    某节点反复出现在轮换日志里时，先看它是否已在名单、名单是否已过期。
+  - ⚠️ **`region-unsupported` 反复出现但名单始终是空的**：查 `Save-NetEnvGptBlocklist` 的参数名与局部变量名
+    是否只差大小写（PowerShell 不区分大小写，后者会静默清掉前者）。2026-10-06 实测过两起同类静默事故，
+    现由 `tests\netenv.tests.ps1` 的「源码静态检查：变量名大小写冲突」用例兜住。
+  - ⚠️ **日志出现 `GPT 节点轮换失败：<节点>=unreachable, …` 而你还在等它自己恢复**：先分清是
+    **地区问题**还是**池子枯死**。免费池是一批烂节点，整体死亡率极高（2026-10-06 18:00 实测
+    `auto-urltest` 全部 **650** 个成员做一次组测速，8 秒只回来 **1 个**，649 个已死）。
+    一条命令看清池子还剩多少：
+    ```
+    curl -s "http://127.0.0.1:19090/group/auto-urltest/delay?url=https://chatgpt.com/cdn-cgi/trace&timeout=8000"
+    ```
+    只回 1-2 个 key 就说明是**节点供给**问题，不是代码问题 —— 此时轮换再怎么挑也挑不出东西。
+    - 别把 curl 的 403 当地区封锁：`https://chatgpt.com/` 对非浏览器客户端常返回 **403 + `Cf-Mitigated: challenge`**
+      （body 里有 `Just a moment`），这是 Cloudflare 的常规人机挑战，**真浏览器能过**。
+      判地区只看两个：`cdn-cgi/trace` 是否 200、`api.openai.com/v1/models` 是否 401。
+    - 补池子：`.\netenv.ps1 nodes refresh`。它**只重写 `data/merged.yaml`，不 reload 也不 apply**，
+      所以运行中是安全的；但**运行中的 mihomo 不会自己读新配置**，刷新完必须重载：
+      `PUT http://127.0.0.1:19090/configs?force=true`，body `{"path":"<仓库>\\data\\merged.yaml"}`（成功回 204）。
+      ⚠️ **重载会把 gpt-node / gpt-probe 的选择重置为组内第一个成员**（实测重置成了中国节点
+      `🟢🇨🇳_github.com/Ruk1ng001_6607b0a2`，对 GPT 是地区封锁）—— 重载后**必须立刻再轮换一次**，
+      否则等于亲手把线上出口换成一个 403 节点。
+    - 订阅源本身可能是坏的：`data/sub-state.json` 的 `sourceStatus` 会写「下载失败: 基础连接已经关闭」
+      /「The operation has timed out.」。注意 `data/*.json` 与 `merged.yaml` 都是**无 BOM 的 UTF-8**，
+      用 PowerShell 5.1 `Get-Content` 直接看会是 GBK 乱码 —— 那是显示层现象，不代表文件坏了
+      （`Read-NetEnvJson` 显式按 UTF-8 读）。
   - 浏览器侧还需系统代理开着：档位得是 `proxy`（`.\netenv.ps1 apply -profile proxy`），否则浏览器直连照样超时
     （一键脚本：`.\fix-browser-proxy.ps1`）。
 - **浏览器（Edge/Chrome）打不开 GitHub，但同一时刻 `git` / CLI 正常**：这是**档位语义**，不是故障。

@@ -3,6 +3,7 @@
     "ports":  {
                   "mihomoMixed":  7890,
                   "mihomoHttp":  7897,
+                  "mihomoProbe":  7898,
                   "mihomoController":  19090,
                   "newApi":  8093,
                   "subStore":  3001
@@ -44,8 +45,14 @@
                                     "failThreshold":  1,
                                     "group":  "gpt-adaptive",
                                     "rotateGroup":  "gpt-node",
+                                    "probeGroup":  "gpt-probe",
                                     "rankGroup":  "auto-urltest",
                                     "maxCandidates":  8,
+                                     "rankRetryTimeoutMs":  15000,
+                                     "poolScanMax":  40,
+                                     "poolScanTimeoutSec":  4,
+                                     "poolScanBudgetSec":  120,
+                                    "blocklistHours":  12,
                                     "recoverMinIntervalMinutes":  5
                                 }
                },

@@ -604,6 +604,8 @@ Describe 'GPT 专项（长期可访问）' {
     ($incIdx -ge 0) | Should Be $true
     ($thrIdx -gt $incIdx) | Should Be $true
   }
+
+  It '配置读取必须按"影子根目录"解析（install/portable 两种 mode 下同一份 JSON 都要能读到阈值）' {
     # 用真 core.ps1 解析影子配置（只认键，不碰网络）；root 指向影子目录，避免污染其他用例
     $shadowDir = Join-Path $env:TEMP ('netenv-shadow-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Path (Join-Path $shadowDir 'config'), (Join-Path $shadowDir 'lib') -Force | Out-Null
@@ -614,6 +616,362 @@ Describe 'GPT 专项（长期可访问）' {
     $gotCfg = & (Join-Path $PSHOME 'powershell.exe') -NoProfile -ExecutionPolicy Bypass -Command ". '$corePath'; (Read-NetEnvConfig -Quiet).health.gptProbe.failThreshold"
     ([string]$gotCfg).Trim() | Should Be '1'
     Remove-Item -LiteralPath $shadowDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Describe 'GPT 探针入口隔离（2026-10-06 事故的根本约束）' {
+  # 事故：轮换把**线上组** gpt-node 逐个候选切过去复测。16:53:07 探针连败触发轮换，
+  # 16:53:27 用户正好在复测窗里打开 chatgpt.com，流量走香港候选 → Cloudflare 403
+  # unsupported_country_region_territory「无法加载网站」；16:53:32 轮换失败还原。
+  # 治法：单开 listeners + IN-PORT → 独立 select 组 gpt-probe，复测只在探针池里进行，
+  # 线上组只在某个候选**真的通过地区判据**之后做一次原子切换。
+  # 下面两个用例把约束钉在行为层：一旦有人把复测改回线上组、或因变量名大小写同名
+  # （2026-10-06 实测：局部 $probePort 与参数 $ProbePort 是同一个变量，赋 0 即清零参数）
+  # 而静默退回旧路径，这里立刻红。
+
+  It '探针入口配置齐全，且端口不与任何既有端口冲突（重复端口会让 mihomo 拒绝加载）' {
+    $cfg = Read-NetEnvConfig
+    [int]$cfg.ports.mihomoProbe | Should BeGreaterThan 0
+    $cfg.health.gptProbe.probeGroup | Should Be 'gpt-probe'
+    [int]$cfg.health.gptProbe.blocklistHours | Should BeGreaterThan 0
+    ($cfg.ports.PSObject.Properties.Value | Group-Object | Where-Object { $_.Count -gt 1 }).Count | Should Be 0
+  }
+
+  It '合并配置必须生成探针入口：listeners + gpt-probe 组 + 首条 IN-PORT 规则，且 mihomo 能加载' {
+    $cfg = Read-NetEnvConfig
+    $dir = Join-Path $env:TEMP ('netenv-merged-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    try {
+      @(
+        'proxies:'
+        '  - name: node-a'
+        '    type: trojan'
+        '    server: 1.2.3.4'
+        '    port: 443'
+        '    password: pw'
+        '  - name: node-b'
+        '    type: trojan'
+        '    server: 1.2.3.5'
+        '    port: 443'
+        '    password: pw'
+      ) | Set-Content -LiteralPath (Join-Path $dir 'test.yaml') -Encoding utf8
+      $merged = Build-NetEnvMergedConfig -SubDir $dir -Cfg $cfg
+      $merged | Should Match 'name: gpt-probe'
+      ($merged -match '(?ms)name:\s*gpt-probe\s*\r?\n\s*type:\s*select') | Should Be $true
+      $merged | Should Match ('port: ' + [int]$cfg.ports.mihomoProbe)
+      $merged | Should Match ('IN-PORT,' + [int]$cfg.ports.mihomoProbe + ',gpt-probe')
+      # IN-PORT 必须在规则表最前：落到任何 DOMAIN-SUFFIX/MATCH 之后就永远不生效
+      $ipIdx = $merged.IndexOf('IN-PORT,')
+      ($ipIdx -gt 0) | Should Be $true
+      ($ipIdx -lt $merged.IndexOf('- MATCH,')) | Should Be $true
+      ($ipIdx -lt $merged.IndexOf('- DOMAIN-SUFFIX,')) | Should Be $true
+      # 交给真 mihomo 静态加载：写坏的 YAML 会被自愈循环推给运行中的实例
+      $mihomo = Join-Path $root 'data\bin\mihomo-windows-amd64.exe'
+      if (Test-Path -LiteralPath $mihomo) {
+        $gen = Join-Path $dir 'gen.yaml'
+        [System.IO.File]::WriteAllText($gen, $merged, (New-Object System.Text.UTF8Encoding($false)))
+        $null = & $mihomo -t -d (Join-Path $root 'data') -f $gen 2>&1
+        $LASTEXITCODE | Should Be 0
+      }
+    } finally {
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '探针入口可用时：复测只切 gpt-probe，线上 gpt-node 只在最后原子切一次' {
+    # 用一个真在听的本地 socket 冒充探针入口 —— 代码判断"隔离是否可用"就是 TCP connect 成功
+    $listener = $null
+    $port = 0
+    foreach ($p in 20000..20060) {
+      try {
+        $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList @([System.Net.IPAddress]::Loopback, $p)
+        $listener.Start()
+        $port = $p
+        break
+      } catch { $listener = $null }
+    }
+    ($port -gt 0) | Should Be $true
+
+    $names = @('Get-NetEnvJsonUtf8', 'Set-NetEnvGptSelectedNode', 'Test-NetEnvGptEgress', 'Get-NetEnvGptBlocklist',
+      'Add-NetEnvGptBlockedNode', 'Remove-NetEnvGptBlockedNode', 'Save-NetEnvTextFile', 'Invoke-NetEnvJsonPut')
+    $orig = @{}
+    foreach ($n in $names) { $orig[$n] = (Get-Item ("function:script:" + $n)).ScriptBlock }
+    $script:swCalls = New-Object System.Collections.Generic.List[string]
+    $script:egressPorts = New-Object System.Collections.Generic.List[int]
+    try {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value {
+        param($Uri, $TimeoutSec)
+        if ($Uri -like '*/proxies') {
+          return ('{"proxies":{"gpt-node":{"now":"node-current"},"gpt-probe":{"now":"node-current"},"auto-urltest":{"now":"node-current"}}}' | ConvertFrom-Json)
+        }
+        return ('{"node-a":10,"node-b":20,"node-current":30}' | ConvertFrom-Json)
+      }
+      Set-Item function:script:Set-NetEnvGptSelectedNode -Value {
+        param([string]$Node, [int]$ControllerPort = 19090, [string]$Group = 'gpt-node')
+        $script:swCalls.Add(("$Group|" + $Node))
+        return $true
+      }
+      Set-Item function:script:Test-NetEnvGptEgress -Value {
+        param($ProbeUrl, $TimeoutSec, $ProxyPort, $Attempts)
+        $script:egressPorts.Add([int]$ProxyPort)
+        return [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 12; Url = $ProbeUrl; Reason = $null }
+      }
+      Set-Item function:script:Get-NetEnvGptBlocklist -Value { return @{} }
+      Set-Item function:script:Add-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Remove-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Save-NetEnvTextFile -Value { param($Path, $Content) }
+      Set-Item function:script:Invoke-NetEnvJsonPut -Value { param($Uri, $Json, $TimeoutSec) return $true }
+
+      $r = Invoke-NetEnvGptNodeRotation -Group 'gpt-node' -AdaptiveGroup 'gpt-adaptive' `
+        -ProbeUrl 'https://api.openai.com/v1/models' -LatencyUrl 'https://chatgpt.com/cdn-cgi/trace' `
+        -RankGroup 'auto-urltest' -ControllerPort 1 -MaxCandidates 3 -ProbeTimeoutSec 1 `
+        -ProbeGroup 'gpt-probe' -ProbePort $port -BlocklistHours 12
+      $r.Ok | Should Be $true
+
+      # ① 探针流量必须从探针入口出网（不是线上端口）
+      $script:egressPorts.Count | Should BeGreaterThan 0
+      $script:egressPorts[0] | Should Be $port
+      # ② 整个复测期间线上组只能被切**一次**（就是成功后的原子切换）
+      $live = @($script:swCalls | Where-Object { $_ -like 'gpt-node|*' })
+      $live.Count | Should Be 1
+      $live[0] | Should Be ('gpt-node|' + $r.Node)
+      # ③ 原子切换必须是最后一次动作，候选复测都发生在它之前
+      $script:swCalls[$script:swCalls.Count - 1] | Should Be ('gpt-node|' + $r.Node)
+      $script:swCalls[0] | Should Match '^gpt-probe\|'
+    } finally {
+      if ($listener) { $listener.Stop() }
+      foreach ($n in $names) { Set-Item ("function:script:" + $n) -Value $orig[$n] }
+    }
+  }
+
+  It '探针入口不可用时：退回旧路径并如实降级（缺入口不得让自愈失效）' {
+    $names = @('Get-NetEnvJsonUtf8', 'Set-NetEnvGptSelectedNode', 'Test-NetEnvGptEgress', 'Get-NetEnvGptBlocklist',
+      'Add-NetEnvGptBlockedNode', 'Remove-NetEnvGptBlockedNode', 'Save-NetEnvTextFile', 'Invoke-NetEnvJsonPut')
+    $orig = @{}
+    foreach ($n in $names) { $orig[$n] = (Get-Item ("function:script:" + $n)).ScriptBlock }
+    $script:swCalls2 = New-Object System.Collections.Generic.List[string]
+    $script:egressPorts2 = New-Object System.Collections.Generic.List[int]
+    try {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value {
+        param($Uri, $TimeoutSec)
+        if ($Uri -like '*/proxies') {
+          return ('{"proxies":{"gpt-node":{"now":"node-current"},"gpt-probe":{"now":"node-current"},"auto-urltest":{"now":"node-current"}}}' | ConvertFrom-Json)
+        }
+        return ('{"node-a":10,"node-current":30}' | ConvertFrom-Json)
+      }
+      Set-Item function:script:Set-NetEnvGptSelectedNode -Value {
+        param([string]$Node, [int]$ControllerPort = 19090, [string]$Group = 'gpt-node')
+        $script:swCalls2.Add(("$Group|" + $Node))
+        return $true
+      }
+      Set-Item function:script:Test-NetEnvGptEgress -Value {
+        param($ProbeUrl, $TimeoutSec, $ProxyPort, $Attempts)
+        $script:egressPorts2.Add([int]$ProxyPort)
+        return [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 12; Url = $ProbeUrl; Reason = $null }
+      }
+      Set-Item function:script:Get-NetEnvGptBlocklist -Value { return @{} }
+      Set-Item function:script:Add-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Remove-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Save-NetEnvTextFile -Value { param($Path, $Content) }
+      Set-Item function:script:Invoke-NetEnvJsonPut -Value { param($Uri, $Json, $TimeoutSec) return $true }
+
+      # 端口 1 上没有任何监听 → 隔离通道不可用
+      $r = Invoke-NetEnvGptNodeRotation -Group 'gpt-node' -AdaptiveGroup 'gpt-adaptive' `
+        -ProbeUrl 'https://api.openai.com/v1/models' -RankGroup 'auto-urltest' -ControllerPort 1 `
+        -MaxCandidates 2 -ProbeTimeoutSec 1 -ProbeGroup 'gpt-probe' -ProbePort 1 -BlocklistHours 12
+      $r.Ok | Should Be $true
+      # 退化路径：复测本身就切线上组（端口回落 0 → Test-NetEnvGptEgress 按配置走线上端口）
+      $script:swCalls2[0] | Should Match '^gpt-node\|'
+      $script:egressPorts2[0] | Should Be 0
+    } finally {
+      foreach ($n in $names) { Set-Item ("function:script:" + $n) -Value $orig[$n] }
+    }
+  }
+
+  It '预筛候选全失败时：全池兜底扫描必须从探针池深处捞出可用节点（2026-10-06 17:34/17:50 两次"有池子换不动"）' {
+    # 事故形态：$RankGroup 的一次并行测速只回传极少数成员（17:34 整池只回 1 个、还是地区封锁的
+    # 香港节点），或干脆 504 零候选（17:50）。旧实现到这里就放弃了 —— 明明池子里还有几百个
+    # 没被预筛命中的节点。本用例把可用节点放在预筛结果之外，逼出兜底扫描这条路径。
+    $listener = $null
+    $port = 0
+    foreach ($p in 20100..20160) {
+      try {
+        $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList @([System.Net.IPAddress]::Loopback, $p)
+        $listener.Start()
+        $port = $p
+        break
+      } catch { $listener = $null }
+    }
+    ($port -gt 0) | Should Be $true
+
+    $names = @('Get-NetEnvJsonUtf8', 'Set-NetEnvGptSelectedNode', 'Test-NetEnvGptEgress', 'Get-NetEnvGptBlocklist',
+      'Add-NetEnvGptBlockedNode', 'Remove-NetEnvGptBlockedNode', 'Save-NetEnvTextFile', 'Invoke-NetEnvJsonPut')
+    $orig = @{}
+    foreach ($n in $names) { $orig[$n] = (Get-Item ("function:script:" + $n)).ScriptBlock }
+    $script:swCalls3 = New-Object System.Collections.Generic.List[string]
+    $script:probedNodes3 = New-Object System.Collections.Generic.List[string]
+    $script:probeTimeouts3 = New-Object System.Collections.Generic.List[int]
+    $script:selected3 = 'node-a'
+    try {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value {
+        param($Uri, $TimeoutSec)
+        if ($Uri -like '*/proxies') {
+          return ('{"proxies":{"gpt-node":{"now":"node-a","all":["node-a","node-b","node-pool1","node-pool2","node-pool3"]},' +
+            '"gpt-probe":{"now":"node-a","all":["node-a","node-b","node-pool1","node-pool2","node-pool3"]},' +
+            '"auto-urltest":{"now":"node-a","all":["node-a","node-b"]}}}' | ConvertFrom-Json)
+        }
+        # 预筛只回传 2 个 —— 正是 17:34 那次"整池只有 1-2 个响应"的形态
+        return ('{"node-a":10,"node-b":20}' | ConvertFrom-Json)
+      }
+      Set-Item function:script:Set-NetEnvGptSelectedNode -Value {
+        param([string]$Node, [int]$ControllerPort = 19090, [string]$Group = 'gpt-node')
+        $script:swCalls3.Add(("$Group|" + $Node))
+        $script:selected3 = $Node
+        return $true
+      }
+      Set-Item function:script:Test-NetEnvGptEgress -Value {
+        param($ProbeUrl, $TimeoutSec, $ProxyPort, $Attempts)
+        $script:probedNodes3.Add($script:selected3)
+        $script:probeTimeouts3.Add([int]$TimeoutSec)
+        # 只有池子深处的 node-pool3 真正通过地区判据；预筛候选与另外两个池内节点都是 unreachable
+        if ($script:selected3 -eq 'node-pool3') {
+          return [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 12; Url = $ProbeUrl; Reason = $null }
+        }
+        return [PSCustomObject]@{ Ok = $false; Status = 0; Ms = 0; Url = $ProbeUrl; Reason = 'unreachable' }
+      }
+      Set-Item function:script:Get-NetEnvGptBlocklist -Value { return @{} }
+      Set-Item function:script:Add-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Remove-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Save-NetEnvTextFile -Value { param($Path, $Content) }
+      Set-Item function:script:Invoke-NetEnvJsonPut -Value { param($Uri, $Json, $TimeoutSec) return $true }
+
+      $r = Invoke-NetEnvGptNodeRotation -Group 'gpt-node' -AdaptiveGroup 'gpt-adaptive' `
+        -ProbeUrl 'https://api.openai.com/v1/models' -LatencyUrl 'https://chatgpt.com/cdn-cgi/trace' `
+        -RankGroup 'auto-urltest' -ControllerPort 1 -MaxCandidates 3 -ProbeTimeoutSec 3 `
+        -ProbeGroup 'gpt-probe' -ProbePort $port -BlocklistHours 12 `
+        -PoolScanMax 10 -PoolScanTimeoutSec 1 -PoolScanBudgetSec 60 -PoolScanSeed 12345
+
+      $r.Ok | Should Be $true
+      $r.Node | Should Be 'node-pool3'
+      # 预筛 2 个候选全部失败后，兜底扫描把剩下的池成员也试了（共 5 个：node-a/node-b + 3 个池节点）
+      $script:probedNodes3.Count | Should Be 5
+      $script:probedNodes3[0] | Should Be 'node-a'
+      ($script:probedNodes3 -contains 'node-pool3') | Should Be $true
+      # 预筛段用 ProbeTimeoutSec，兜底扫描段必须换成更短的 PoolScanTimeoutSec（控制单点成本）
+      $script:probeTimeouts3[0] | Should Be 3
+      $script:probeTimeouts3[$script:probeTimeouts3.Count - 1] | Should Be 1
+      # 隔离不变量仍然成立：复测全程只切探针组，线上组只在最后原子切一次
+      $live = @($script:swCalls3 | Where-Object { $_ -like 'gpt-node|*' })
+      $live.Count | Should Be 1
+      $live[0] | Should Be 'gpt-node|node-pool3'
+      $script:swCalls3[0] | Should Match '^gpt-probe\|'
+      $script:swCalls3[$script:swCalls3.Count - 1] | Should Be 'gpt-node|node-pool3'
+    } finally {
+      if ($listener) { $listener.Stop() }
+      foreach ($n in $names) { Set-Item ("function:script:" + $n) -Value $orig[$n] }
+    }
+  }
+
+  It '兜底扫描只在隔离通道上启用（退路模式下全池扫一遍等于把线上流量扔进海选）' {
+    $names = @('Get-NetEnvJsonUtf8', 'Set-NetEnvGptSelectedNode', 'Test-NetEnvGptEgress', 'Get-NetEnvGptBlocklist',
+      'Add-NetEnvGptBlockedNode', 'Remove-NetEnvGptBlockedNode', 'Save-NetEnvTextFile', 'Invoke-NetEnvJsonPut')
+    $orig = @{}
+    foreach ($n in $names) { $orig[$n] = (Get-Item ("function:script:" + $n)).ScriptBlock }
+    $script:swCalls4 = New-Object System.Collections.Generic.List[string]
+    try {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value {
+        param($Uri, $TimeoutSec)
+        if ($Uri -like '*/proxies') {
+          return ('{"proxies":{"gpt-node":{"now":"node-a","all":["node-a","node-pool1","node-pool2","node-pool3"]},' +
+            '"gpt-probe":{"now":"node-a","all":["node-a","node-pool1","node-pool2","node-pool3"]},' +
+            '"auto-urltest":{"now":"node-a","all":["node-a"]}}}' | ConvertFrom-Json)
+        }
+        return ('{"node-a":10}' | ConvertFrom-Json)
+      }
+      Set-Item function:script:Set-NetEnvGptSelectedNode -Value {
+        param([string]$Node, [int]$ControllerPort = 19090, [string]$Group = 'gpt-node')
+        $script:swCalls4.Add(("$Group|" + $Node))
+        return $true
+      }
+      Set-Item function:script:Test-NetEnvGptEgress -Value {
+        param($ProbeUrl, $TimeoutSec, $ProxyPort, $Attempts)
+        return [PSCustomObject]@{ Ok = $false; Status = 0; Ms = 0; Url = $ProbeUrl; Reason = 'unreachable' }
+      }
+      Set-Item function:script:Get-NetEnvGptBlocklist -Value { return @{} }
+      Set-Item function:script:Add-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Remove-NetEnvGptBlockedNode -Value { return $true }
+      Set-Item function:script:Save-NetEnvTextFile -Value { param($Path, $Content) }
+      Set-Item function:script:Invoke-NetEnvJsonPut -Value { param($Uri, $Json, $TimeoutSec) return $true }
+
+      # 端口 1 无监听 → 隔离不可用 → 不得展开全池兜底
+      $r = Invoke-NetEnvGptNodeRotation -Group 'gpt-node' -AdaptiveGroup 'gpt-adaptive' `
+        -ProbeUrl 'https://api.openai.com/v1/models' -RankGroup 'auto-urltest' -ControllerPort 1 `
+        -MaxCandidates 3 -ProbeTimeoutSec 1 -ProbeGroup 'gpt-probe' -ProbePort 1 -BlocklistHours 12 `
+        -PoolScanMax 40 -PoolScanTimeoutSec 1 -PoolScanBudgetSec 60 -PoolScanSeed 12345
+
+      $r.Ok | Should Be $false
+      # 只有预筛候选 node-a 被复测（外加最后还原），池内 node-pool1..3 一个都不许碰
+      @($script:swCalls4 | Where-Object { $_ -like '*|node-pool*' }).Count | Should Be 0
+    } finally {
+      foreach ($n in $names) { Set-Item ("function:script:" + $n) -Value $orig[$n] }
+    }
+  }
+}
+
+Describe '源码静态检查：变量名大小写冲突' {
+  It '同一作用域内不得出现仅大小写不同的变量名（PowerShell 不区分大小写，后者会静默覆盖前者）' {
+    # 2026-10-06 实测两起同类事故，都由本检查发现：
+    #   ① core.ps1 参数 $ProbePort 被局部 $probePort = 0 清零 → 探针入口隔离永远走退化路径，
+    #      线上组在复测期间真的被切走（用户看到 ChatGPT「无法加载网站」的那个行为）；
+    #   ② Save-NetEnvGptBlocklist 参数 $Entries 被局部 $entries = [ordered]@{} 清成空表 →
+    #      地区名单永远写成空，同一天同一个香港节点被重复复测 8 次。
+    # 两者都不会报错、只在运行期表现成"功能没生效"，靠人眼 review 极难发现。
+    $skip = @('true', 'false', 'null', '_', 'PSItem', 'args', 'input', 'MyInvocation', 'PSBoundParameters',
+      'PSScriptRoot', 'PSCommandPath', 'Error', 'Host', 'PWD', 'PID', 'HOME', 'ExecutionContext',
+      'LASTEXITCODE', 'Matches', 'PSHOME', 'StackTrace', 'This')
+    $bad = New-Object System.Collections.Generic.List[string]
+    $scripts = @(Get-ChildItem -Path $root -Recurse -File -Filter '*.ps1')
+
+    foreach ($f in $scripts) {
+      $errs = $null
+      $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+      if (@($errs).Count -gt 0) { continue }   # 语法错误由"5.1 解析器零错误"类用例负责
+      $fns = @($ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+      $scopes = @()
+      foreach ($fn in $fns) {
+        $nested = @($fn.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object { $_ -ne $fn })
+        $scopes += [PSCustomObject]@{ Name = $fn.Name; Node = $fn; Nested = $nested }
+      }
+      $scopes += [PSCustomObject]@{ Name = '<script>'; Node = $ast; Nested = $fns }
+
+      foreach ($sc in $scopes) {
+        $vars = @($sc.Node.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | Where-Object {
+          $v = $_
+          $inside = $false
+          foreach ($n in $sc.Nested) {
+            if ($n.Extent.StartOffset -le $v.Extent.StartOffset -and $n.Extent.EndOffset -ge $v.Extent.EndOffset) { $inside = $true; break }
+          }
+          -not $inside
+        })
+        $names = @{}
+        foreach ($v in $vars) {
+          $nm = $v.VariablePath.UserPath
+          if ($nm -match '^[0-9]+$') { continue }
+          if ($skip -contains $nm) { continue }
+          $key = $nm.ToLowerInvariant()
+          if (-not $names.ContainsKey($key)) { $names[$key] = New-Object System.Collections.Generic.HashSet[string] }
+          [void]$names[$key].Add($nm)
+        }
+        foreach ($key in @($names.Keys)) {
+          if ($names[$key].Count -gt 1) {
+            $bad.Add(("{0} :: {1} :: {2}" -f $f.Name, $sc.Name, (($names[$key]) -join ' / ')))
+          }
+        }
+      }
+    }
+    (($bad | Sort-Object -Unique) -join ' | ') | Should Be ''
+  }
 }
 
 Describe '日志函数健壮性' {

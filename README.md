@@ -60,6 +60,9 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 - **订阅仅 HTTPS**，剥离 `script` 等危险字段；订阅 URL 存 Windows 凭据管理器，不入盘
 - **代理面不对外**：mihomo 的 `mixed-port` / `http` / `external-controller` 均绑定 `127.0.0.1`，`allow-lan: false`
 - **`.ps1` 一律带 UTF-8 BOM**：脚本含中文，且计划任务以 `powershell.exe`（Windows PowerShell 5.1）`-File` 方式执行；无 BOM 时 5.1 会按 ANSI/GBK 解码导致中文乱码。**改动任何 `.ps1` 后请复查 BOM。**
+  检查/修补用 `.\tests\ensure-bom.ps1 -Check`（只检查）或 `.\tests\ensure-bom.ps1`（补 BOM，幂等）；`tests\regression.ps1` 已把它作为**前置守卫**，
+  缺 BOM 时直接中止并点名文件。2026-10-06 实测过一次自伤：编辑工具剥掉 4 个 `lib\*.ps1` 的 BOM，生产自愈循环连续 7 分钟报
+  `所在位置 ...core.ps1:260 字符: 29`，日志里还夹着中文乱码 —— 这类"中文错误文本 + 字符偏移"一律先怀疑无 BOM，而不是逻辑错误。
 - **兼容 Windows PowerShell 5.1**：环境可能只有 `powershell.exe` 而无 `pwsh.exe`。因此脚本内**不得使用 PS7 专属语法**（`::new()` 构造、`??`、三元 `? :`、`-Parallel` 等），统一用 `New-Object` 与显式 `if/else`。
 - **路径全部通用化**：不写死用户名或安装盘符 —— 用户目录用 `$env:USERPROFILE`，仓库内部用 `$PSScriptRoot` 推导，外部工具（7z）用 `Get-NetEnvSevenZip` 探测，客户端注入点用 `%USERPROFILE%` 占位符。换机只需改 `config/netenv.json`。
 - **可选外部依赖缺失必须降级而非崩溃**：`npm`、`gh`、7-Zip 等未安装时跳过该步并记 WARN；在 `$ErrorActionPreference='Stop'` 下直接调用不存在的命令会终止整条流程。
@@ -96,6 +99,44 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   - **为什么不能并进 `health.probeUrls` 的 OR 判据**：google 通只说明"能上网"，与 OpenAI 是否接受该出口地区无关；
     OR 判据下"google 正常但 GPT 全废"不会触发任何自愈（与 github 专项探针同一类盲区）。
   - **为什么恢复动作是轮换节点而不是刷订阅**：地区不受支持是**节点属性**，刷订阅换一批节点照样可能全是香港。
+  - **探针入口隔离（`ports.mihomoProbe`，默认 `7898`）—— 2026-10-06 事故的根治**：早期实现是**直接切线上组**
+    `gpt-node` 来逐个候选复测。mihomo 没有"只让某一次请求走某节点"的接口，于是每个候选的复测窗口
+    （最长 `ProbeTimeoutSec`）内**真实流量全程跟着候选走**。实测 2026-10-06 16:53:07 探针连败触发轮换，
+    16:53:27 用户正好在窗口内打开 `chatgpt.com`，流量落到香港候选，Cloudflare 返回
+    `unsupported_country_region_territory`「无法加载网站」；16:53:32 轮换失败才还原 ——
+    **用户看到的不是"节点挂了"，而是轮换本身**。
+    现在 `lib/nodes.ps1` 额外生成三样东西：`listeners:` 里一个 `mixed` 入口（`ports.mihomoProbe`）+
+    `rules:` **首条** `IN-PORT,<port>,gpt-probe` + 与 `gpt-node` 同成员的 **select 组 `gpt-probe`**。
+    复测全部经探针入口出网，线上组只在某候选**真的通过地区判据**之后做**一次原子切换**。
+    ⚠️ 三条硬约束：①`IN-PORT` 必须排在规则表**最前**（落到 `DOMAIN-SUFFIX`/`MATCH` 之后就永不生效）；
+    ②探针端口不得与 `ports` 内任何既有端口重复（重复会让 mihomo 直接拒绝加载配置）；
+    ③`gptProbe.probeGroup` 与 `ports.mihomoProbe` 是配套的，只改一个会让复测走错出口。
+    自检锚点：日志出现 `GPT 节点轮换：探针专用入口不可用（组 gpt-probe / 端口 0）→ 退回切线上组的旧路径`
+    即代表隔离**没生效**（`doctor` 与 `tests\netenv.tests.ps1` 的"GPT 探针入口隔离"用例都会红）。
+  - **地区封锁名单（`data/gpt-blocklist.json`，`gptProbe.blocklistHours` 默认 12）**：被判 `region-unsupported`
+    的节点写入名单，并在候选排序阶段剔除。必要性同"为什么不是刷订阅"—— `region-unsupported` 是节点属性，
+    不会自己恢复；2026-10-06 一天之内同一个香港节点被重复复测 **8 次**，等于每次都在线上窗口里再捅一次。
+    名单**带 TTL、过期即失效**（地区策略会变，不做永久屏蔽）。
+  - **候选枯竭时的全池兜底扫描（`gptProbe.poolScanMax` 默认 40 / `poolScanTimeoutSec` 4 / `poolScanBudgetSec` 120）**
+    **—— 2026-10-06 18:00 二次故障的修法**：那次不是地区问题，而是**池子整体枯死** ——
+    对 `auto-urltest` 全部 650 个成员做一次组测速，8 秒只回来 **1 个**响应（`hysteria2-1561765064`），
+    649 个节点已死。旧实现只看预筛榜（`rankGroup` 并行测速的 top N），榜上全军覆没就报"轮换失败"，
+    于是自愈循环只能干等 —— 明明池子里还有几百个没被预筛命中的节点没试过。
+    现在候选构建完之后，若**预筛结果不足**且**探针隔离可用**，就从 `gpt-probe` 组的**全量成员**里
+    随机起点（Fisher-Yates，`poolScanSeed` 可复现）追加最多 `poolScanMax` 个候选，跳过
+    `DIRECT`/`REJECT`/`GLOBAL`、已在候选里的、以及地区名单里的节点；兜底段单点超时降到
+    `poolScanTimeoutSec`，整体受 `poolScanBudgetSec` 预算约束（超预算记 WARN `全池兜底扫描预算 …s 用尽` 后收手）。
+    另有一处配套放宽：`rankGroup` **首次测速零结果**（整组 504）时，用 `rankRetryTimeoutMs`（默认 15 s）重测一次，
+    因为瞬时抖动会让整组测速假性全灭。
+    ⚠️ **兜底扫描只在探针隔离可用时启用**：退路模式下每试一个候选都会切线上组，全池扫一遍
+    等于把用户的流量扔进海选（`tests\netenv.tests.ps1` 有专门用例钉住这条约束）。
+    调参注意：`poolScanMax × poolScanTimeoutSec` 不应超过 `poolScanBudgetSec`，否则预算先到、扫不到 `poolScanMax` 个。
+  - **⚠️ 变量名大小写：PowerShell 不区分大小写**。2026-10-06 实测两起静默事故，现由
+    `tests\netenv.tests.ps1` 的"源码静态检查：变量名大小写冲突"用例兜住：
+    ①`Invoke-NetEnvGptNodeRotation` 内局部 `$probePort = 0` 与参数 `$ProbePort` **是同一个变量**，
+    赋值即把参数清零 → 隔离分支永远走不到，上面那条"退回旧路径"的降级**静默生效**；
+    ②`Save-NetEnvGptBlocklist` 的参数 `$Entries` 被局部 `$entries = [ordered]@{}` 清成空表 →
+    地区名单**永远写成空**。两者都不抛错，只在运行期表现成"功能没生效"。**命名局部变量时不要只靠大小写区分。**
 - **系统代理漂移自愈**：`supervisor-loop` 每轮比对 WinINET 实际值与当前档位期望值并重写（5 分钟退避）。
   必要性：第三方 VPN / 代理客户端连接时会接管系统代理，而**进程探活与出品探针都发现不了** ——
   端口照样 LISTEN、经隧道探针照样通，吃系统代理的程序却已全部退回直连（典型的"全绿着坏"）。

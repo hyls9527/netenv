@@ -25,7 +25,7 @@ function Invoke-NetEnvDoctor {
   foreach ($p in $cfg.ports.PSObject.Properties) {
     $owner = Get-PortOwner $p.Value
     if ($owner) {
-      $expected = @{ mihomoMixed='mihomo'; mihomoHttp='mihomo'; mihomoController='mihomo'; newApi='new-api'; subStore='sub-store' }
+      $expected = @{ mihomoMixed='mihomo'; mihomoHttp='mihomo'; mihomoProbe='mihomo'; mihomoController='mihomo'; newApi='new-api'; subStore='sub-store' }
       $match = ($owner.Process -match ($expected[$p.Name] -replace '-','[-_]?')) -or ($owner.Path -match 'mihomo|new-api|sub-store')
       Add-Check "port.$($p.Name)" "端口 $($p.Value) ($($p.Name))" $match "被 $($owner.Process) (PID $($owner.Pid)) 占用$(if ($match) {'（符合预期）'} else {'（冲突：非 NetEnv 进程占用）'})"
     } elseif ($optional -contains $p.Name) {

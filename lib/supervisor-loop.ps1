@@ -87,8 +87,20 @@ $gptProbeUrls = @('https://api.openai.com/v1/models')
 $gptFailThreshold = 2
 $gptAdaptiveGroup = 'gpt-adaptive'
 $gptRotateGroup = 'gpt-node'
+# 探针专用入口：轮换在这上面复测候选，线上 gptRotateGroup 全程不动（理由见 core.ps1 的
+# Invoke-NetEnvGptNodeRotation 注释）。组名与端口由 nodes.ps1 生成的 listeners/IN-PORT 提供。
+$gptProbeGroup = 'gpt-probe'
+$gptBlocklistHours = 12
 $gptRankGroup = 'auto-urltest'
 $gptMaxCandidates = 8
+# 全池兜底扫描：预筛候选全失败时，从探针池里按顺序（每次换起始位置）再验一批。
+# 2026-10-06 两次实测触发点：17:34 整池只有 1 个节点响应（且是地区封锁的香港节点）、
+# 17:50 组测速直接 504 零候选 —— 有池子却换不动。单点 4s / 总预算 120s 是"够捞到活节点
+# 又不至于把自愈循环按在地上"的折中（自愈间隔 1 分钟，轮换本身最长会占掉这一轮）。
+$gptRankRetryTimeoutMs = 15000
+$gptPoolScanMax = 40
+$gptPoolScanTimeoutSec = 4
+$gptPoolScanBudgetSec = 120
 $gptRecoverMinInterval = 10
 $gptLatencyUrl = 'https://chatgpt.com/cdn-cgi/trace'
 if ($cfg.health -and $cfg.health.gptProbe) {
@@ -100,8 +112,14 @@ if ($cfg.health -and $cfg.health.gptProbe) {
   if ($tp.failThreshold) { $gptFailThreshold = [int]$tp.failThreshold }
   if ($tp.group) { $gptAdaptiveGroup = [string]$tp.group }
   if ($tp.rotateGroup) { $gptRotateGroup = [string]$tp.rotateGroup }
+  if ($tp.probeGroup) { $gptProbeGroup = [string]$tp.probeGroup }
+  if ($tp.blocklistHours) { $gptBlocklistHours = [int]$tp.blocklistHours }
   if ($tp.rankGroup) { $gptRankGroup = [string]$tp.rankGroup }
   if ($tp.maxCandidates) { $gptMaxCandidates = [int]$tp.maxCandidates }
+  if ($tp.rankRetryTimeoutMs) { $gptRankRetryTimeoutMs = [int]$tp.rankRetryTimeoutMs }
+  if ($tp.poolScanMax) { $gptPoolScanMax = [int]$tp.poolScanMax }
+  if ($tp.poolScanTimeoutSec) { $gptPoolScanTimeoutSec = [int]$tp.poolScanTimeoutSec }
+  if ($tp.poolScanBudgetSec) { $gptPoolScanBudgetSec = [int]$tp.poolScanBudgetSec }
   if ($null -ne $tp.recoverMinIntervalMinutes) { $gptRecoverMinInterval = [int]$tp.recoverMinIntervalMinutes }
 }
 if ($cfg.subscription -and $cfg.subscription.gptUrlTest -and $cfg.subscription.gptUrlTest.url) { $gptLatencyUrl = [string]$cfg.subscription.gptUrlTest.url }
@@ -111,6 +129,9 @@ if ($gptMaxCandidates -lt 1) { $gptMaxCandidates = 8 }
 
 $controllerPort = 19090
 if ($cfg.ports -and $cfg.ports.mihomoController) { $controllerPort = [int]$cfg.ports.mihomoController }
+# 探针入口端口：0 表示配置里没有（老配置），轮换会自动退回切线上组的旧路径并记 WARN。
+$gptProbePort = 0
+if ($cfg.ports -and $cfg.ports.mihomoProbe) { $gptProbePort = [int]$cfg.ports.mihomoProbe }
 $mergedFile = Join-Path $paths.Data 'merged.yaml'
 
 # 系统代理漂移自愈参数。为什么放在自愈循环里：进程探活与出品探针都发现不了这件事 ——
@@ -122,7 +143,7 @@ $lastProxyRepair = (Get-Date).AddMinutes(-$proxyRepairMinInterval - 1)
 
 Write-NetEnvLog 'INFO' "supervisor-loop: 启动，进程探活 $interval 分钟 / 出品探针 $probeInterval 分钟 / 目标 $($probeUrls -join ' | ')"
 if ($githubProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: github 专项探针 启用 / 目标 $($githubProbeUrls -join ' | ') / 连败 $githubFailThreshold 次触发 $githubGroup 组测速" }
-if ($gptProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: GPT 专项探针 启用 / 目标 $($gptProbeUrls -join ' | ') / 连败 $gptFailThreshold 次触发 $gptRotateGroup 节点轮换（地区判据）" }
+if ($gptProbeOn) { Write-NetEnvLog 'INFO' "supervisor-loop: GPT 专项探针 启用 / 目标 $($gptProbeUrls -join ' | ') / 连败 $gptFailThreshold 次触发 $gptRotateGroup 节点轮换（地区判据）/ 复测入口 $gptProbeGroup@$gptProbePort$(if ($gptProbePort -le 0) { '（未配置：将退回切线上组的旧路径）' } else { '' }) / 兜底：$gptRankGroup 放宽 $($gptRankRetryTimeoutMs)ms + 全池扫描 $gptPoolScanMax 个@$($gptPoolScanTimeoutSec)s（预算 $($gptPoolScanBudgetSec)s）" }
 
 $healthFile = Join-Path $paths.Data 'health-state.json'
 # 心跳文件：每实例一个（按 PID），供 doctor 发现"循环没起来"与"重复循环"。
@@ -362,7 +383,7 @@ while ($true) {
             Write-NetEnvLog 'WARN' "GPT 不可用 → 轮换 $gptRotateGroup 节点（按地区判据逐个复测）"
             # 先记账再动手（与出品/github 链同口径）：轮换自身抛错时同样要退避
             $st.gptLastRecoverAt = (Get-Date -Format 's')
-            $rot = Invoke-NetEnvGptNodeRotation -Group $gptRotateGroup -AdaptiveGroup $gptAdaptiveGroup -ProbeUrl $gptProbeUrls[0] -LatencyUrl $gptLatencyUrl -RankGroup $gptRankGroup -ControllerPort $controllerPort -MaxCandidates $gptMaxCandidates
+            $rot = Invoke-NetEnvGptNodeRotation -Group $gptRotateGroup -AdaptiveGroup $gptAdaptiveGroup -ProbeUrl $gptProbeUrls[0] -LatencyUrl $gptLatencyUrl -RankGroup $gptRankGroup -ControllerPort $controllerPort -MaxCandidates $gptMaxCandidates -ProbeGroup $gptProbeGroup -ProbePort $gptProbePort -BlocklistHours $gptBlocklistHours -RankRetryTimeoutMs $gptRankRetryTimeoutMs -PoolScanMax $gptPoolScanMax -PoolScanTimeoutSec $gptPoolScanTimeoutSec -PoolScanBudgetSec $gptPoolScanBudgetSec
             if ($rot.Ok) {
               Write-NetEnvLog 'INFO' "GPT 节点已轮换：$($rot.Node)（$($rot.Detail)），复测中"
               Start-Sleep -Seconds 3
