@@ -14,16 +14,41 @@ if ($Live) {
   $dataDir = Join-Path $root 'data'
   $reg = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
   $proc = $null
+
+  # 冒烟端口一律从端口表派生（不写死 7897）；读不到就中止，而不是猜一个。
+  $livePort = 0
+  try {
+    $cfgJson = (Get-Content -LiteralPath (Join-Path $root 'config\netenv.json') -Raw -Encoding UTF8) | ConvertFrom-Json
+    $livePort = [int]$cfgJson.ports.mihomoHttp
+  } catch { $livePort = 0 }
+  if ($livePort -le 0) {
+    Write-Host '[live] 中止：无法从 config/netenv.json 读到 ports.mihomoHttp'
+    exit 2
+  }
+
+  # 前置守卫（2026-10-09 实测补上）：本机生产 mihomo 常驻监听该端口时，这里另起的临时实例
+  # 必然绑定失败并立刻退出，而紧接着的"端口在听吗"读到的正是**生产进程** —— 旧实现于是打印
+  # listening=True（PID 指向已死进程）继续往下跑，还可能在 finally 里对真实环境的档位执行
+  # apply --undo。即：在正常运行的机器上跑 -Live，结论完全不可信。
+  $occupied = Get-NetTCPConnection -State Listen -LocalPort $livePort -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($occupied) {
+    Write-Host ("[live] 中止：端口 {0} 已被 PID {1} 占用 —— -Live 需要独占该端口才能判定真实结果。" -f $livePort, $occupied.OwningProcess)
+    Write-Host '[live] 用法：先停掉生产 mihomo 再跑；或改 config/netenv.json 的 ports.mihomoHttp 到一个空闲端口'
+    exit 2
+  }
+
   try {
     if (-not (Test-Path -LiteralPath $mihomo)) { throw 'mihomo binary missing' }
     $cfg = Join-Path $dataDir 'test-mihomo.yaml'
     if (-not (Test-Path -LiteralPath $cfg)) {
-      Set-Content -LiteralPath $cfg -Value "port: 7897`nmode: rule`nlog-level: silent`nipv6: false`nrules:`n  - MATCH,DIRECT" -Encoding utf8
+      Set-Content -LiteralPath $cfg -Value ("port: {0}`nmode: rule`nlog-level: silent`nipv6: false`nrules:`n  - MATCH,DIRECT" -f $livePort) -Encoding utf8
     }
     $proc = Start-Process -FilePath $mihomo -ArgumentList @('-d', ('"' + $dataDir + '"'), '-f', ('"' + $cfg + '"')) -WindowStyle Hidden -PassThru
     Start-Sleep -Seconds 3
-    $listening = [bool](Get-NetTCPConnection -State Listen -LocalPort 7897 -ErrorAction SilentlyContinue)
-    Write-Host ("[live] mihomo 7897 listening={0} pid={1}" -f $listening, $proc.Id)
+    # 启动即退出必须先报出来：否则"端口在听"可能来自别的进程，探测结论全是假的
+    if ($proc.HasExited) { throw ("mihomo 启动即退出（exit $($proc.ExitCode)）：配置或端口不可用") }
+    $listening = [bool](Get-NetTCPConnection -State Listen -LocalPort $livePort -ErrorAction SilentlyContinue)
+    Write-Host ("[live] mihomo {0} listening={1} pid={2}" -f $livePort, $listening, $proc.Id)
     if (-not $listening) { throw 'mihomo not listening' }
     & $psExe -NoProfile -ExecutionPolicy Bypass -File $netenv apply -profile proxy | Out-Host
     $ie = Get-ItemProperty -Path $reg

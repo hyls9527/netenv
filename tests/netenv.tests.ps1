@@ -330,6 +330,78 @@ Describe 'doctor JSON 输出' {
     # fail 计数必须与 checks 里 ok=false 的条数一致（防统计与实际状态漂移）
     @($obj.checks | Where-Object { -not $_.ok }).Count | Should Be ([int]$obj.fails)
   }
+
+  It '订阅新鲜度必须取 lastSuccessAt：节点池冻结时不得因为"刷新尝试过"而报绿' {
+    # 判据回归锚点：updatedAt 记的是"刷新尝试"，lastSuccessAt 记的是"真正重写 merged.yaml"。
+    # 若有人把 doctor 改回读 updatedAt，第一个场景会变绿 → 本用例红（2026-10-08 的真实缺陷）。
+    $saved = $script:NetEnvRoot
+    $dir = Join-Path $env:TEMP ('netenv-subfresh-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\merged.yaml'), "proxies:`n", (New-Object System.Text.UTF8Encoding($false)))
+      $now = (Get-Date).ToString('s')
+      $old = (Get-Date).AddHours(-30).ToString('s')
+
+      . "$root\lib\doctor.ps1"
+      # 桩掉最慢的三个系统查询与网络探针（与上一个用例同口径，本用例只验新鲜度判据）
+      function Get-ScheduledTask { [CmdletBinding()] param() }
+      function Get-CimInstance { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+      function Get-NetTCPConnection { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+      function Test-NetEnvEgress { param([string]$ProbeUrl, [int]$TimeoutSec, [int]$ProxyPort, [switch]$VerifyCert)
+        [PSCustomObject]@{ Ok = $true; Status = 204; Ms = 1; Url = $ProbeUrl; Error = $null } }
+      function Test-NetEnvGptEgress { param([string]$ProbeUrl, [int]$ProxyPort, [int]$TimeoutSec)
+        [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 1; Url = $ProbeUrl; Reason = $null } }
+      # 注意：dot-source doctor.ps1 会把 $script:NetEnvRoot 重置回仓库，必须在它之后再改
+      $script:NetEnvRoot = $dir
+
+      # 场景 1：刚"尝试"过刷新（updatedAt=现在）但节点最后一次成功更新在 30 小时前 → 必须红
+      $frozen = @{
+        updatedAt = $now; lastSuccessAt = $old; mergedWritten = $false; anySourceOk = $false
+        sourceStatus = @{ 'free-x' = '下载失败: 基础连接已经关闭' }
+      } | ConvertTo-Json -Depth 4
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'), $frozen, (New-Object System.Text.UTF8Encoding($false)))
+      $o1 = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+      $sf1 = @($o1.checks | Where-Object { $_.id -eq 'subfresh' })
+      $sf1.Count | Should Be 1
+      $sf1[0].ok | Should Be $false
+      $sf1[0].detail | Should Match '30'
+      # 失败源必须可见：源全挂这件事不能只体现在一个被顶掉的时间戳里
+      $sf1[0].detail | Should Match 'free-x'
+
+      # 场景 2（反向）：lastSuccessAt 新鲜 → 必须绿，防止"一律判红"把告警训废
+      $fresh = @{
+        updatedAt = $now; lastSuccessAt = $now; mergedWritten = $true; anySourceOk = $true
+        sourceStatus = @{ 'free-x' = 'OK, 3 节点' }
+      } | ConvertTo-Json -Depth 4
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'), $fresh, (New-Object System.Text.UTF8Encoding($false)))
+      $o2 = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+      @($o2.checks | Where-Object { $_.id -eq 'subfresh' })[0].ok | Should Be $true
+
+      # 场景 3（旧状态文件 + 节点池其实很旧）：没有 lastSuccessAt 时必须按 merged.yaml 落盘时间判，
+      # **不能退回 updatedAt** —— 否则"升级前的状态 + 刚尝试过刷新"会把缺陷原样放回来
+      (Get-Item -LiteralPath (Join-Path $dir 'data\merged.yaml')).LastWriteTime = (Get-Date).AddHours(-30)
+      $legacy = @{
+        updatedAt = $now; mergedWritten = $true; sourceStatus = @{ 'free-x' = 'OK, 3 节点' }
+      } | ConvertTo-Json -Depth 4
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'), $legacy, (New-Object System.Text.UTF8Encoding($false)))
+      $o3 = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+      $sf3 = @($o3.checks | Where-Object { $_.id -eq 'subfresh' })
+      $sf3[0].ok | Should Be $false
+      $sf3[0].detail | Should Match 'merged.yaml 落盘时间'
+
+      # 场景 4（旧状态文件 + 节点确实刚更新）：同口径下必须绿，防止"一律判红"把告警训废
+      (Get-Item -LiteralPath (Join-Path $dir 'data\merged.yaml')).LastWriteTime = (Get-Date)
+      $o4 = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+      $sf4 = @($o4.checks | Where-Object { $_.id -eq 'subfresh' })
+      $sf4[0].ok | Should Be $true
+      $sf4[0].detail | Should Match 'merged.yaml 落盘时间'
+    } finally {
+      $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
 }
 
 Describe '订阅刷新（离线，不触网）' {
@@ -356,6 +428,86 @@ Describe '订阅刷新（离线，不触网）' {
       $parsed.sourceStatus.'test-disabled' | Should Be '已停用'
     } finally {
       $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '源全失败时不得顶掉 lastSuccessAt（"刷新尝试过"不等于"节点更新过"）' {
+    # 2026-10-08 17:18 实测缺陷：4 个已配置源全部下载失败、merged.yaml 一个字节没动（与 sub-state
+    # 里的 hash 逐字节相同），只因为写了一次 updatedAt，doctor 的「订阅新鲜度」就报"8 小时前" ——
+    # 节点池已冻结 28 小时却全绿。本用例把"失败不得顶掉成功时间"钉死。
+    $saved = $script:NetEnvRoot
+    $dir = Join-Path $env:TEMP ('netenv-refresh-fail-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      # 离线：一个"未配置"的源（不会触网）+ 一个停用源 → 本次刷新必然零成功
+      '[{"id":"test-no-such-source","name":"x","trusted":true},{"id":"test-disabled","name":"y","disabled":true}]' |
+        Set-Content -LiteralPath (Join-Path $dir 'config\sources.json') -Encoding utf8
+      foreach ($g in 'GeoSite.dat', 'geoip.metadb') {
+        [System.IO.File]::WriteAllBytes((Join-Path $dir ("data\" + $g)), (New-Object byte[] 1000001))
+      }
+      # 预置冻结的旧节点池 + 30 小时前的"上次成功"
+      $oldMerged = "proxies:`n  - name: frozen-node`n    type: trojan`n    server: 1.2.3.4`n    port: 443`n    password: pw`n"
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\merged.yaml'), $oldMerged, (New-Object System.Text.UTF8Encoding($false)))
+      $oldStamp = (Get-Date).AddHours(-30).ToString('s')
+      $oldState = @{ updatedAt = $oldStamp; lastSuccessAt = $oldStamp; mergedWritten = $true; sourceStatus = @{}; hash = 'old' } | ConvertTo-Json -Depth 4
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'), $oldState, (New-Object System.Text.UTF8Encoding($false)))
+      $beforeHash = (Get-FileHash -LiteralPath (Join-Path $dir 'data\merged.yaml') -Algorithm SHA256).Hash
+
+      $script:NetEnvRoot = $dir
+      $st = Invoke-NetEnvNodesRefresh
+
+      $st.anySourceOk | Should Be $false
+      $st.mergedWritten | Should Be $false
+      [string]$st.lastSuccessAt | Should Be $oldStamp
+      $parsed = (Read-NetEnvFileText (Join-Path $dir 'data\sub-state.json')) | ConvertFrom-Json
+      [string]$parsed.lastSuccessAt | Should Be $oldStamp
+      # updatedAt 照常前进（它记的是"尝试过"），但绝不能拿来当新鲜度
+      ([datetime]$parsed.updatedAt -gt [datetime]$oldStamp) | Should Be $true
+      (Get-FileHash -LiteralPath (Join-Path $dir 'data\merged.yaml') -Algorithm SHA256).Hash | Should Be $beforeHash
+    } finally {
+      $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '有源成功时 lastSuccessAt 必须前进到本次时间（mergedWritten/anySourceOk 同口径）' {
+    $saved = $script:NetEnvRoot
+    $hadCred = Test-Path function:\Get-NetEnvCredentialValue
+    $hadIwr = Test-Path function:\Invoke-WebRequest
+    $dir = Join-Path $env:TEMP ('netenv-refresh-ok-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      '[{"id":"test-ok","name":"ok","trusted":true}]' | Set-Content -LiteralPath (Join-Path $dir 'config\sources.json') -Encoding utf8
+      foreach ($g in 'GeoSite.dat', 'geoip.metadb') {
+        [System.IO.File]::WriteAllBytes((Join-Path $dir ("data\" + $g)), (New-Object byte[] 1000001))
+      }
+      # 桩掉凭据与下载：本用例只验状态机口径，不触网
+      function Get-NetEnvCredentialValue { param([string]$TargetName) return 'https://sub.example.invalid/nodes.yaml' }
+      function Invoke-WebRequest {
+        param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$TimeoutSec)
+        [System.IO.File]::WriteAllText($OutFile, "proxies:`n  - name: node-a`n    type: trojan`n    server: 1.2.3.4`n    port: 443`n    password: pw`n", (New-Object System.Text.UTF8Encoding($false)))
+      }
+      $oldStamp = (Get-Date).AddHours(-30).ToString('s')
+      $oldState = @{ updatedAt = $oldStamp; lastSuccessAt = $oldStamp; mergedWritten = $true; sourceStatus = @{} } | ConvertTo-Json -Depth 4
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'), $oldState, (New-Object System.Text.UTF8Encoding($false)))
+
+      $script:NetEnvRoot = $dir
+      $st = Invoke-NetEnvNodesRefresh
+
+      $st.anySourceOk | Should Be $true
+      $st.mergedWritten | Should Be $true
+      [string]$st.lastSuccessAt | Should Be ([string]$st.updatedAt)
+      ([datetime]$st.lastSuccessAt -gt (Get-Date).AddMinutes(-5)) | Should Be $true
+      (Test-Path -LiteralPath (Join-Path $dir 'data\merged.yaml')) | Should Be $true
+    } finally {
+      $script:NetEnvRoot = $saved
+      if (-not $hadCred -and (Test-Path function:\Get-NetEnvCredentialValue)) { Remove-Item function:\Get-NetEnvCredentialValue -Force -ErrorAction SilentlyContinue }
+      if (-not $hadIwr -and (Test-Path function:\Invoke-WebRequest)) { Remove-Item function:\Invoke-WebRequest -Force -ErrorAction SilentlyContinue }
       Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
   }

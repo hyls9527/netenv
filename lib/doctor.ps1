@@ -185,13 +185,54 @@ function Invoke-NetEnvDoctor {
   }
 
   # 订阅新鲜度（状态文件可能被半截写入，解析失败要报出来而不是让 doctor 崩掉）
+  # ⚠️ 判据取 lastSuccessAt —— 上次**真正重写 merged.yaml** 的时间，绝不能取 updatedAt（刷新*尝试*
+  # 时间）：源全挂的那次刷新照样把 updatedAt 顶成现在，于是"节点池冻结 28 小时 + 所有订阅源全挂"
+  # 反而永远显示新鲜。2026-10-08 17:18 实测（4 源全失败，merged.yaml 与 sub-state.hash 逐字节相同，
+  # 而 doctor 报"8 小时前"），详见 nodes.ps1 同名字段的注释 —— 又是一次"全绿着坏"。
   $paths = Get-NetEnvPaths
   $subState = Join-Path $paths.Data 'sub-state.json'
   if (Test-Path -LiteralPath $subState) {
     try {
       $st = (Read-NetEnvFileText $subState) | ConvertFrom-Json
-      $age = ((Get-Date) - [datetime]$st.updatedAt).TotalHours
-      Add-Check 'subfresh' '订阅新鲜度' ($age -lt 26) "上次更新 $([math]::Round($age,1)) 小时前（告警阈值 26h）"
+      $mergedFile = Join-Path $paths.Data 'merged.yaml'
+      $stamp = $null
+      $stampNote = ''
+      if (-not (Test-Path -LiteralPath $mergedFile)) {
+        Add-Check 'subfresh' '订阅新鲜度' $false 'merged.yaml 缺失（从未成功刷新出节点）'
+      } else {
+        if ($st.lastSuccessAt) {
+          try { $stamp = [datetime]$st.lastSuccessAt } catch { $stamp = $null }
+        }
+        if (-not $stamp) {
+          # 没有 lastSuccessAt（2026-10-09 之前写的旧状态文件，或尚无成功记录）时取 merged.yaml 的
+          # 落盘时间：它是"节点池最后一次被改写"的直接证据，且**不受失败的刷新尝试影响**。
+          # 退回 updatedAt 等于把刚修掉的缺陷原样放回来 —— 失败的尝试照样把 updatedAt 顶成现在。
+          try { $stamp = (Get-Item -LiteralPath $mergedFile).LastWriteTime } catch { $stamp = $null }
+          if ($stamp) { $stampNote = '；无 lastSuccessAt，按 merged.yaml 落盘时间计' }
+        }
+        if (-not $stamp) {
+          try { $stamp = [datetime]$st.updatedAt } catch { $stamp = $null }
+          if ($stamp) { $stampNote = '；按刷新尝试时间计（lastSuccessAt 与 merged.yaml 落盘时间均不可用）' }
+        }
+        if (-not $stamp) {
+          Add-Check 'subfresh' '订阅新鲜度' $false 'sub-state.json 无可用时间戳（lastSuccessAt/updatedAt 均不可解析）'
+        } else {
+          $age = ((Get-Date) - $stamp).TotalHours
+          # 最近一次刷新没产出新节点时把失败源写进 detail：此时节点可能还新鲜（刷新只在出品探针
+          # 已判失败时被触发，源常常跟着一起抖），所以不直接判红；但"池子随时可能断供"必须可见，
+          # 不能再让一个被顶掉的 updatedAt 把它盖住。
+          if ($st.mergedWritten -eq $false) {
+            $failedSrc = @()
+            if ($st.sourceStatus) {
+              $failedSrc = @($st.sourceStatus.PSObject.Properties | Where-Object {
+                $_.Value -notlike 'OK,*' -and $_.Value -ne '已停用' -and $_.Value -notlike '未配置*'
+              } | ForEach-Object { "$($_.Name)=$($_.Value)" })
+            }
+            $stampNote += "；最近一次刷新未产出新节点$(if ($failedSrc.Count) { '（失败源: ' + ($failedSrc -join '; ') + '）' } else { '' })"
+          }
+          Add-Check 'subfresh' '订阅新鲜度' ($age -lt 26) "上次成功更新 $([math]::Round($age,1)) 小时前（告警阈值 26h）$stampNote"
+        }
+      }
     } catch {
       Add-Check 'subfresh' '订阅新鲜度' $false "sub-state.json 不可解析: $($_.Exception.Message)"
     }

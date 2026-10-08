@@ -90,10 +90,12 @@ function Invoke-NetEnvNodesRefresh {
 
   $mergedFile = Join-Path $paths.Data 'merged.yaml'
   $mergedEmpty = $false
+  $mergedWritten = $false
   if ($anyOk) {
     $merged = Build-NetEnvMergedConfig $subDir $cfg
     if ($merged -and $merged.Trim().Length -gt 0) {
       Save-NetEnvTextFile -Path $mergedFile -Content $merged
+      $mergedWritten = $true
     } else {
       # 源里有 proxies: 却一个可用节点都没产出（名字全被过滤、字段非法等）时，
       # 绝不能写空配置 —— 旧 merged.yaml 是当前唯一可用出口，覆盖等于主动断网。
@@ -106,16 +108,43 @@ function Invoke-NetEnvNodesRefresh {
   Get-ChildItem -LiteralPath $subDir -Filter '*.yaml' -ErrorAction SilentlyContinue | ForEach-Object {
     $totalNodes += ([regex]::Matches((Get-Content -LiteralPath $_.FullName -Raw), '(?m)^\s+-\s+name\s*:')).Count
   }
+
+  # 【为什么要有 lastSuccessAt】旧实现只写 updatedAt = 本次刷新**尝试**的时间，而 doctor 的
+  # 「订阅新鲜度」就是拿它算 age —— 于是"所有订阅源全挂、merged.yaml 一个字节没动"的那次刷新
+  # 也把新鲜度刷新成现在：2026-10-08 17:18 实测 4 个已配置源全部下载失败，merged.yaml 仍是
+  # 10-07 21:25 的旧文件（与 sub-state 里的 hash 逐字节相同），doctor 却报"上次更新 8 小时前"，
+  # 实际节点池已冻结 28 小时 —— 正是本工具反复要抓的"全绿着坏"（源全挂时反而永远不告警）。
+  # 现拆成两个时间戳：updatedAt = 本次尝试（保留原语义，供 status/排障），
+  # lastSuccessAt = 上次**真正重写 merged.yaml** 的时间（本次没写成则跨轮继承，绝不被尝试时间顶掉）。
+  $stateFile = Join-Path $paths.Data 'sub-state.json'
+  $lastSuccessAt = $null
+  if (Test-Path -LiteralPath $stateFile) {
+    try {
+      $prevState = (Read-NetEnvFileText $stateFile) | ConvertFrom-Json
+      if ($prevState.lastSuccessAt) { $lastSuccessAt = [string]$prevState.lastSuccessAt }
+    } catch {
+      # 半截写入/损坏时不能顺带把"上次成功时间"清零（那等于把陈旧节点重新判成新鲜）
+      Write-NetEnvLog 'WARN' "nodes refresh: 旧 sub-state.json 不可解析，无法继承上次成功时间（$($_.Exception.Message)）"
+    }
+  }
+  $nowStamp = Get-Date -Format 's'
+  if ($mergedWritten) { $lastSuccessAt = $nowStamp }
+  $sourceOkCount = @($sourceStatus.Values | Where-Object { $_ -like 'OK,*' }).Count
+
   $state = [ordered]@{
-    updatedAt = (Get-Date -Format 's')
-    nodeCount = $totalNodes
+    updatedAt = $nowStamp
+    lastSuccessAt = $lastSuccessAt
+    mergedWritten = $mergedWritten
     mergedEmpty = $mergedEmpty
+    anySourceOk = $anyOk
+    sourceOkCount = $sourceOkCount
+    nodeCount = $totalNodes
     sourceStatus = $sourceStatus
     hash = if (Test-Path -LiteralPath $mergedFile) {
       (Get-FileHash -LiteralPath $mergedFile -Algorithm SHA256).Hash
     } else { '' }
   }
-  Save-NetEnvTextFile -Path (Join-Path $paths.Data 'sub-state.json') -Content ($state | ConvertTo-Json -Depth 4)
+  Save-NetEnvTextFile -Path $stateFile -Content ($state | ConvertTo-Json -Depth 4)
   return $state
 }
 

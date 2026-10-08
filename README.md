@@ -160,12 +160,23 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
 - **失败统计只认"已部署"的服务**：二进制不存在的可选服务（new-api/Sub-Store）直接跳过，
   不参与失败计数（否则未部署的 new-api 会让日志每分钟刷一条 ERROR，把真故障淹没）
 - 日志按天轮转、脱敏、UTF-8 编码，保留天数由 `logging.rotateDays`（默认 14）决定，`netenv clean` 用同一口径（`logs/`，不入库）
-- **订阅刷新不是自动的**：需手动 `nodes refresh`（或用你自己的调度；`merged.yaml` 的生成时间可在 `data/sub-state.json` 查看）
+- **订阅刷新不是自动的**：需手动 `nodes refresh`（或用你自己的调度；`data/sub-state.json` 里
+  `lastSuccessAt` = 上次**真正重写 `merged.yaml`** 的时间，`updatedAt` = 上次刷新**尝试**的时间）。
+  ⚠️ **两个时间戳必须分开记**：2026-10-08 17:18 实测 4 个已配置源全部下载失败、`merged.yaml` 一个字节没动
+  （与 `sub-state.hash` 逐字节相同），而旧实现只写 `updatedAt`，`doctor` 的「订阅新鲜度」照样报"8 小时前" ——
+  **节点池实际已冻结 28 小时、订阅源全挂，却一路全绿**（又一次"绿着坏"）。
+  现在 `doctor` 一律按 `lastSuccessAt` 算 age，并在最近一次刷新**零产出**时把**失败源清单**写进 detail；
+  没有该字段的旧状态文件按 **`merged.yaml` 的落盘时间**算（**不得退回 `updatedAt`** —— 那等于把缺陷原样放回来），
+  `merged.yaml` 缺失直接判红。
 - 非管理员可用的只读动作：`doctor` / `status`；`adopt -Apply` 等接管动作需要管理员权限
 
 ## 维护与自检
 
 - 回归：`Import-Module Pester; .\tests\regression.ps1`（Pester 3.4，跑 3 轮）；`.\tests\regression.ps1 -Live` 会真起 mihomo 并临时切系统代理，仅在需要冒烟时用
+  - ⚠️ **`-Live` 需要独占 `ports.mihomoHttp`（默认 7897）**：生产 mihomo 正在监听时它会**前置中止（exit 2）**，
+    而不是给出一个假绿。必要性：临时实例端口冲突会立刻退出，而紧随的"端口在听吗"读到的其实是**生产进程**，
+    于是旧实现打印 `listening=True`（PID 指向已死进程）继续跑，还会在 `finally` 里对真实档位执行 `apply --undo`
+    —— 2026-10-09 实测。要跑真冒烟：先停生产 mihomo，或把 `ports.mihomoHttp` 改到空闲端口。
 - 体检：`netenv doctor`（失败项退出码 1）；`doctor --json` 提供给 MCP 的 `netenv_doctor_summary`
 - **改完任何 `.ps1` 必须复查 UTF-8 BOM**：编辑工具常常顺手剥掉 BOM，5.1 会按 GBK 解码使中文破坏引号配对（`doctor` 有 `脚本 UTF-8 BOM` 项兜底）
 - Windows PowerShell 5.1 实测坑位（改代码前先看，避免重新踩）：

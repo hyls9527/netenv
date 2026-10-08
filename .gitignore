@@ -9,8 +9,12 @@ export/
 *secrets*.txt
 config/local.*
 
-# ????????????????
+# 运行态数据库（可能含凭据，禁止入库）
 lib/one-api.db
 *.db
 data/bin/
+
+# 浏览器自动化（Chromium）以本仓为 cwd 时留下的临时 HSTS 档案目录，非本仓产物
+# （2026-10-07 实测在仓库根出现 hsts_<随机>/TransportSecurity，会让 git status 常驻未跟踪项）
+hsts_*/
 
