@@ -59,6 +59,11 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   ⚠️ **同一域名不得同时出现在直连列表与 `githubAdaptiveDomains`**：DIRECT 规则在前会胜出，自适应规则永远不可达（曾是真实缺陷）。
 - **订阅仅 HTTPS**，剥离 `script` 等危险字段；订阅 URL 存 Windows 凭据管理器，不入盘
 - **代理面不对外**：mihomo 的 `mixed-port` / `http` / `external-controller` 均绑定 `127.0.0.1`，`allow-lan: false`
+- **TLS 协议必须含 TLS 1.3**：`core.ps1` 顶部 `Set-NetEnvTlsProtocol` 把 `Tls13` 并进系统原有协议位（`SystemDefault` → `Tls13`；已是 `Tls12` 的机器 → `Tls12, Tls13`），枚举不存在时降级到 `Tls12` 且不抛错。
+  ⚠️ **本机链路上 TLS 1.2 握手被干扰**：2026-10-14 实测三个订阅源在 `nodes refresh` 里全部报 `基础连接已经关闭: 发送时发生错误`，而**同一 URL 走 `curl.exe` 直连返回 http=200 并取回完整正文**（277776 / 640791 / 21674 字节）；在 .NET 里显式指定 `Tls12` 仍失败、改 `Tls13` 立刻 200。
+  症状是"订阅看起来过期、GitHub 却还能打开"——能打开只是 `github-adaptive` 组的 `DIRECT` 成员在兜底，**924 个节点实际全部不可达**，节点池冻结 106 小时、`doctor` 报 4 项红而 `status` 照样报绿。
+  修正前请先确认：`curl.exe` 能取回正文而 `Invoke-WebRequest` 不能，就是本缺陷；不要先去怀疑订阅 URL 失效或节点全挂。
+  另注：这类干扰是**间歇性**的（同一批 URL 连续两轮，一轮 2/6 失败、一轮全成），因此 `nodes refresh` 对每个源做 3 次重试；单源失败率约 33% → <5%。
 - **`.ps1` 一律带 UTF-8 BOM**：脚本含中文，且计划任务以 `powershell.exe`（Windows PowerShell 5.1）`-File` 方式执行；无 BOM 时 5.1 会按 ANSI/GBK 解码导致中文乱码。**改动任何 `.ps1` 后请复查 BOM。**
   检查/修补用 `.\tests\ensure-bom.ps1 -Check`（只检查）或 `.\tests\ensure-bom.ps1`（补 BOM，幂等）；`tests\regression.ps1` 已把它作为**前置守卫**，
   缺 BOM 时直接中止并点名文件。2026-10-06 实测过一次自伤：编辑工具剥掉 4 个 `lib\*.ps1` 的 BOM，生产自愈循环连续 7 分钟报

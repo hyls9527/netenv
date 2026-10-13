@@ -1,5 +1,31 @@
 ﻿$script:NetEnvRoot = Split-Path -Parent $PSScriptRoot
 
+# TLS 协议兜底 —— 必须在任何 HTTPS 调用之前生效，所以放 core.ps1 顶部。
+# 【为什么需要】2026-10-14 实测：本机链路上 TLS 1.2 握手被干扰，.NET（schannel）默认
+# 协商到的版本直接建连失败，症状是 "基础连接已经关闭: 发送时发生错误" / "The SSL
+# connection could not be established"。当时三个订阅源在 nodes refresh 里全部判成
+# "下载失败"，而订阅本身完全正常 —— 同 URL 走 curl.exe 直连返回 http=200 并取回完整
+# 正文（277776 / 640791 / 21674 字节），走 Invoke-WebRequest 则一律失败；在 .NET 里
+# 显式指定 Tls12 仍失败、改 Tls13 立刻 200。即：**失败的是协议版本，不是订阅源**。
+# 结果是节点池冻结 106 小时、出品探针与 GPT 探针长期全红，而表面上 "GitHub 能打开"
+# （那只是 github-adaptive 组的 DIRECT 成员在兜底，924 个节点实际全部不可达）。
+# 【为什么是 OR 而不是写死 Tls13】凭空把协议收窄到单一版本，到了不支持 TLS 1.3 的机器
+# （老 Windows 上该枚举根本不存在）会从"能连"变成"什么都连不上"。这里保留系统原有协议位、
+# 只把 Tls13 并进去：SystemDefault(0) -> Tls13(12288)，已经是 Tls12 的机器 -> Tls12, Tls13。
+# 【为什么包 try/catch】枚举不存在时抛异常，而 $ErrorActionPreference='Stop' 会让整个
+# 入口（连 doctor 都起不来）直接终止 —— 兜底能力缺失必须是降级，不能是崩溃。
+function Set-NetEnvTlsProtocol {
+  try {
+    $current = [int][Net.ServicePointManager]::SecurityProtocol
+    if (($current -band [int][Net.SecurityProtocolType]::Tls13) -ne 0) { return }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]($current -bor [int][Net.SecurityProtocolType]::Tls13)
+  } catch {
+    # TLS 1.3 不可用（老系统）：退回"至少要有 TLS 1.2"，再不行就维持系统默认，不抛。
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+  }
+}
+Set-NetEnvTlsProtocol
+
 function Get-NetEnvRoot { return $script:NetEnvRoot }
 
 # 显式 UTF-8 读取：Windows PowerShell 5.1 的 Get-Content 默认按 ANSI(GBK) 解码，

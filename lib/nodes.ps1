@@ -59,9 +59,27 @@ function Invoke-NetEnvNodesRefresh {
     [void]$activeIds.Add($src.id)
     # 临时文件含订阅原文（凭据），用 finally 确保异常路径也不残留
     $tmpSub = Join-Path $paths.Data ("dl-" + $src.id + ".sub")
+    # 【为什么要重试】2026-10-14 实测本机链路上 TLS 干扰是**间歇性**的：同一批 URL 连续两轮，
+    # 第一轮 freesub/free-vpn-subs 抛 "基础连接已经关闭"、第二轮全部成功；单次失败率约 2/6。
+    # 而 nodes refresh 一轮只要**任一源**产出节点就算成功，单源没有试错余地时会整轮空跑
+    # （自愈循环随后每 5 分钟重试一次，日志里刷的全是"下载失败"，节点池却一直冻着）。
+    # 三次尝试把单源失败率从 ~33% 压到 ~4% 以下，代价只有失败路径上的 2 秒退避。
+    $text = $null
+    $lastErr = $null
+    for ($dlAttempt = 1; $dlAttempt -le 3; $dlAttempt++) {
+      try {
+        Invoke-WebRequest -Uri $url -OutFile $tmpSub -UseBasicParsing -TimeoutSec 30
+        $text = [System.IO.File]::ReadAllText($tmpSub, [System.Text.Encoding]::UTF8)
+        break
+      } catch {
+        $lastErr = $_
+        if ($dlAttempt -lt 3) { Start-Sleep -Seconds 2 }
+      } finally {
+        if (Test-Path -LiteralPath $tmpSub) { Remove-Item -LiteralPath $tmpSub -Force -ErrorAction SilentlyContinue }
+      }
+    }
     try {
-      Invoke-WebRequest -Uri $url -OutFile $tmpSub -UseBasicParsing -TimeoutSec 30
-      $text = [System.IO.File]::ReadAllText($tmpSub, [System.Text.Encoding]::UTF8)
+      if (-not $text) { throw "下载失败（3 次重试后仍失败）: $($lastErr.Exception.Message)" }
       if ($text -match '(?m)^\s*proxies\s*:') {
         $sanitized = Remove-NetEnvDangerousFields $text
         $out = Join-Path $subDir "$($src.id).yaml"
@@ -75,8 +93,6 @@ function Invoke-NetEnvNodesRefresh {
       }
     } catch {
       $sourceStatus[$src.id] = "下载失败: $($_.Exception.Message)"
-    } finally {
-      if (Test-Path -LiteralPath $tmpSub) { Remove-Item -LiteralPath $tmpSub -Force -ErrorAction SilentlyContinue }
     }
   }
 

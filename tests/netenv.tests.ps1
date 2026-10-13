@@ -404,6 +404,65 @@ Describe 'doctor JSON 输出' {
   }
 }
 
+Describe 'status 订阅新鲜度口径（必须与 doctor 一致）' {
+  It 'status 的 subscriptionHoursAgo 必须取 lastSuccessAt：不得报"刷新尝试过"的时间' {
+    # 2026-10-14 实测缺陷：同一份 sub-state.json，doctor 报 [!!] 106.6 小时（红），
+    # status 报 subscriptionHoursAgo=0.2（绿）—— status 当时读的是 updatedAt。
+    # 本用例是那个缺陷的锚点：若有人把 status 改回 updatedAt，场景 1 会变绿 → 本用例红。
+    $saved = $script:NetEnvRoot
+    $dir = Join-Path $env:TEMP ('netenv-statusfresh-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      . "$root\lib\status.ps1"
+      # 端口查询桩掉：本用例只验时间戳口径，不需要真实监听状态
+      function Get-PortOwner { param([int]$Port) return $null }
+      # 注意：dot-source status.ps1 会重新 dot-source core.ps1 并把 NetEnvRoot 重置回仓库
+      $script:NetEnvRoot = $dir
+
+      $now = (Get-Date).ToString('s')
+      $old = (Get-Date).AddHours(-30).ToString('s')
+
+      # 场景 1：刚"尝试"过刷新（updatedAt=现在）但真正写成功在 30 小时前 → 必须报约 30
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'),
+        (@{ updatedAt = $now; lastSuccessAt = $old; mergedWritten = $false; anySourceOk = $false; nodeCount = 635 } | ConvertTo-Json -Depth 4),
+        (New-Object System.Text.UTF8Encoding($false)))
+      # 注意：Get-NetEnvStatus 不带 -Json 时返回的是 "key: value" 行数组（供 CLI 直接打印），
+      # 断言必须走 -Json 再 ConvertFrom-Json，否则属性取值为空、用例会以误导性的方式失败。
+      $s1 = (Get-NetEnvStatus -Json) | ConvertFrom-Json
+      [double]$s1.subscriptionHoursAgo | Should BeGreaterThan 29
+      [string]$s1.subscriptionLastSuccessAt | Should Be $old
+      # 两个时间戳都要可见：排障时必须能区分"尝试过"与"更新过"
+      [string]$s1.subscriptionUpdatedAt | Should Be $now
+
+      # 场景 2（反向）：lastSuccessAt 新鲜 → 必须报 ~0，防止"一律报旧"把告警训废
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'),
+        (@{ updatedAt = $now; lastSuccessAt = $now; mergedWritten = $true; anySourceOk = $true; nodeCount = 635 } | ConvertTo-Json -Depth 4),
+        (New-Object System.Text.UTF8Encoding($false)))
+      $s2 = (Get-NetEnvStatus -Json) | ConvertFrom-Json
+      [double]$s2.subscriptionHoursAgo | Should BeLessThan 1
+
+      # 场景 3（旧状态文件，无 lastSuccessAt）：按 merged.yaml 落盘时间判，不得退回 updatedAt
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\merged.yaml'), "proxies:`n", (New-Object System.Text.UTF8Encoding($false)))
+      (Get-Item -LiteralPath (Join-Path $dir 'data\merged.yaml')).LastWriteTime = (Get-Date).AddHours(-30)
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data\sub-state.json'),
+        (@{ updatedAt = $now; mergedWritten = $true; nodeCount = 635 } | ConvertTo-Json -Depth 4),
+        (New-Object System.Text.UTF8Encoding($false)))
+      $s3 = (Get-NetEnvStatus -Json) | ConvertFrom-Json
+      [double]$s3.subscriptionHoursAgo | Should BeGreaterThan 29
+
+      # 场景 4（旧状态文件 + 节点确实刚更新）：同口径下必须报 ~0
+      (Get-Item -LiteralPath (Join-Path $dir 'data\merged.yaml')).LastWriteTime = (Get-Date)
+      $s4 = (Get-NetEnvStatus -Json) | ConvertFrom-Json
+      [double]$s4.subscriptionHoursAgo | Should BeLessThan 1
+    } finally {
+      $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
 Describe '订阅刷新（离线，不触网）' {
   It '无可用源时不写 merged.yaml，sub-state.json 仍合法可解析' {
     $saved = $script:NetEnvRoot
@@ -621,6 +680,57 @@ Describe '自愈链完整性' {
     $hbWrite | Should BeLessThan $supervise
     # doctor 必须有可见的存活/单实例验收项，否则重复循环只会静默发生
     (Read-NetEnvFileText (Join-Path $root 'lib\doctor.ps1')) | Should Match "Add-Check 'loop'"
+  }
+
+  It 'doctor 的循环实例数必须复核 PID 存活：刚被重启掉的旧实例不得报成"两个实例"' {
+    # 2026-10-14 实测：重启自愈循环（kill 1992 → 起 27948）后 doctor 立刻报
+    # "发现 2 个循环实例（PID 1992, 27948）"，而 1992 已经不存在 —— 它留下的心跳文件
+    # 仍在新鲜窗口内（清理阈值 3×轮询周期 = 15 分钟），只按时间戳计数就会误报。
+    # 这类假阳性会把"单实例守卫失效"这个真故障的告警训废，所以必须复核 PID。
+    $saved = $script:NetEnvRoot
+    $dir = Join-Path $env:TEMP ('netenv-loopcount-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      . "$root\lib\doctor.ps1"
+      function Get-ScheduledTask { [CmdletBinding()] param() }
+      function Get-CimInstance { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+      function Get-NetTCPConnection { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+      function Test-NetEnvEgress { param([string]$ProbeUrl, [int]$TimeoutSec, [int]$ProxyPort, [switch]$VerifyCert)
+        [PSCustomObject]@{ Ok = $true; Status = 204; Ms = 1; Url = $ProbeUrl; Error = $null } }
+      function Test-NetEnvGptEgress { param([string]$ProbeUrl, [int]$ProxyPort, [int]$TimeoutSec)
+        [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 1; Url = $ProbeUrl; Reason = $null } }
+      # 桩掉进程存在性：$PID（本进程）活着，999999 视为已被重启掉的旧实例。
+      # 必须写全限定名调用真实 cmdlet，否则桩会递归调用自己。
+      function Get-Process {
+        param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+        $idArg = 0
+        for ($i = 0; $i -lt $Rest.Count; $i++) { if ($Rest[$i] -eq '-Id') { $idArg = [int]$Rest[$i + 1] } }
+        if ($idArg -eq 999999) { throw "Cannot find a process with the process identifier 999999." }
+        return [PSCustomObject]@{ Id = $idArg; ProcessName = 'powershell' }
+      }
+      # 注意：dot-source doctor.ps1 会把 $script:NetEnvRoot 重置回仓库，必须在它之后再改
+      $script:NetEnvRoot = $dir
+
+      $now = (Get-Date).ToString('s')
+      foreach ($p in @($PID, 999999)) {
+        [System.IO.File]::WriteAllText((Join-Path $dir "data\loop-heartbeat-$p.json"),
+          (@{ pid = $p; at = $now; startedAt = $now } | ConvertTo-Json),
+          (New-Object System.Text.UTF8Encoding($false)))
+      }
+      $o = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+      $lc = @($o.checks | Where-Object { $_.id -eq 'loop' })
+      $lc.Count | Should Be 1
+      # 关键断言：死掉的旧实例不得计入 → 必须是 1 个实例，且是活着的那个 PID
+      $lc[0].ok | Should Be $true
+      $lc[0].detail | Should Match ([string]$PID)
+      $lc[0].detail | Should Not Match '999999'
+      $lc[0].detail | Should Not Match '2 个循环实例'
+    } finally {
+      $script:NetEnvRoot = $saved
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 }
 

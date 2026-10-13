@@ -251,12 +251,25 @@ function Invoke-NetEnvDoctor {
   # 为什么要查"重复"：实测 2026-09-24 起有一个由计划任务以 RunLevel=Highest 启动的循环，
   # 其 CommandLine 对非管理员不可见，VBS 的单实例守卫看不见它 —— 两个循环交替写
   # health-state.json，把 github/GPT 的连败计数反复清零，专项探针阈值形同虚设（日志无痕迹）。
+  # 【为什么还要查 PID 是否真的活着】2026-10-14 实测：重启自愈循环（kill 1992 → 启动新实例）
+  # 后，doctor 立刻报"发现 2 个循环实例（PID 1992, 27948）"，而 1992 早已不存在 ——
+  # 它留下的是一个**仍在新鲜窗口内**的心跳文件（清理阈值是 3×轮询周期，默认 15 分钟）。
+  # 只看时间戳就等于把"刚被重启掉的旧实例"当成"两个实例在打架"，报警指向错误方向；
+  # 用 Get-Process 复核 PID 后，只有真正活着的进程才算实例，陈旧文件由活着的实例按年龄回收。
   $loopPids = @()
   $hbFreshMin = [Math]::Max(5, [int]$cfg.supervisor.intervalMinutes * 3)
   foreach ($hbFile in (Get-ChildItem -LiteralPath (Get-NetEnvPaths).Data -Filter 'loop-heartbeat-*.json' -ErrorAction SilentlyContinue)) {
     try {
       $hb = (Read-NetEnvFileText $hbFile.FullName) | ConvertFrom-Json
-      if ($hb.at -and ((Get-Date) - [datetime]$hb.at).TotalMinutes -le $hbFreshMin) { $loopPids += [int]$hb.pid }
+      if (-not ($hb.at -and ((Get-Date) - [datetime]$hb.at).TotalMinutes -le $hbFreshMin)) { continue }
+      $hbPid = 0
+      try { $hbPid = [int]$hb.pid } catch { $hbPid = 0 }
+      if ($hbPid -le 0) { continue }
+      # Get-Process 对不存在的 PID 抛错；PID 复用极端情况下可能误判为"活着"，
+      # 但那也意味着真有一个进程占着该 PID，宁可保守报可疑也不要漏报重复实例。
+      $alive = $false
+      try { $alive = [bool](Get-Process -Id $hbPid -ErrorAction Stop) } catch { $alive = $false }
+      if ($alive) { $loopPids += $hbPid }
     } catch { }
   }
   Add-Check 'loop' '自愈循环存活/单实例' ($loopPids.Count -eq 1) $(if ($loopPids.Count -eq 1) {
