@@ -319,7 +319,15 @@ function Invoke-NetEnvDoctor {
     Add-Check 'egress' '端到端出品（经代理实测）' $eg.Ok $(if ($eg.Ok) { "HTTP $($eg.Status) in $($eg.Ms)ms ($($eg.Url))" } else { "全部目标不可用: $($eg.Error)" })
     # 证书校验：mihomo 内部探针不校验证书，会把"能握手但证书无效"误判为健康
     $certUrl = if ($cfg.subscription.githubUrlTest.url) { $cfg.subscription.githubUrlTest.url } else { 'https://github.com/robots.txt' }
-    $cert = Test-NetEnvEgress -ProbeUrl $certUrl -TimeoutSec 10 -VerifyCert
+    # 与下面的 GPT 验收同一口径：一次性验收不该被单次抖动判死。
+    # 实测 2026-10-15 07:21 doctor 报本项红（curl exit=56 未建立连接），4 分钟后同一探针连测
+    # 5 次全部 HTTP 200/exit=0 —— "证书可信"是**稳定属性**（真 MITM 会稳定失败），重试只滤抖动。
+    $cert = $null
+    foreach ($certAttempt in 1..3) {
+      $cert = Test-NetEnvEgress -ProbeUrl $certUrl -TimeoutSec 10 -VerifyCert
+      if ($cert.Ok) { break }
+      if ($certAttempt -lt 3) { Start-Sleep -Seconds 1 }
+    }
     Add-Check 'certverify' '出口证书可信（非 MITM）' $cert.Ok $(if ($cert.Ok) { "HTTP $($cert.Status) in $($cert.Ms)ms（证书有效）" } else { "证书校验失败: $($cert.Error)（换节点或走 DIRECT；见 docs/TROUBLESHOOTING.md）" })
     # GPT 可达性：判据用**真实响应码**而非"能连上就算通"。免费节点里有大量香港节点，
     # 对 OpenAI 属**不受支持地区**：TCP/TLS 与 Cloudflare 边缘全通，chatgpt.com 却应用层 403

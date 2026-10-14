@@ -331,6 +331,38 @@ Describe 'doctor JSON 输出' {
     @($obj.checks | Where-Object { -not $_.ok }).Count | Should Be ([int]$obj.fails)
   }
 
+  It '证书校验：单次抖动不得判红（同一探针最多重试 3 次）' {
+    # 2026-10-15 实测锚点：07:21 doctor 报 certverify 红（curl exit=56 未建立连接），
+    # 4 分钟后同一探针连测 5 次全部 HTTP 200。证书可信是**稳定属性**（真 MITM 会稳定失败），
+    # 若把实现改回"单次探测即定罪"，本用例红。
+    . "$root\lib\doctor.ps1"
+    # 必须强制走到"经代理探测"分支：否则用例结果取决于本机是否真的在跑 mihomo（换机即失效）
+    $pcfg = Read-NetEnvConfig -Quiet
+    $httpPort = [int]$pcfg.ports.mihomoHttp
+    function Get-PortOwner { param([int]$Port)
+      if ($Port -eq $httpPort) { [PSCustomObject]@{ Port = $Port; Pid = 1; Process = 'mihomo'; Path = 'mihomo' } } else { $null } }
+    function Get-ScheduledTask { [CmdletBinding()] param() }
+    function Get-CimInstance { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    function Get-NetTCPConnection { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    function Test-NetEnvEgressAny { param([string[]]$Urls, [int]$TimeoutSec)
+      [PSCustomObject]@{ Ok = $true; Status = 204; Ms = 1; Url = 'stub'; Error = $null } }
+    function Test-NetEnvGptEgress { param([string]$ProbeUrl, [int]$ProxyPort, [int]$TimeoutSec)
+      [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 1; Url = $ProbeUrl; Reason = $null } }
+    $script:certCalls = 0
+    function Test-NetEnvEgress { param([string]$ProbeUrl, [int]$TimeoutSec, [int]$ProxyPort, [switch]$VerifyCert)
+      if ($VerifyCert) {
+        $script:certCalls++
+        # 第一次故意失败，第二次成功 —— 模拟免费出口的瞬时抖动
+        if ($script:certCalls -lt 2) { return [PSCustomObject]@{ Ok = $false; Status = 0; Ms = 1; Url = $ProbeUrl; Error = 'stub: 瞬时抖动' } }
+        return [PSCustomObject]@{ Ok = $true; Status = 200; Ms = 1; Url = $ProbeUrl; Error = $null }
+      }
+      [PSCustomObject]@{ Ok = $true; Status = 204; Ms = 1; Url = $ProbeUrl; Error = $null } }
+    $o = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+    $cv = @($o.checks | Where-Object { $_.id -eq 'certverify' })[0]
+    $cv.ok | Should Be $true
+    $script:certCalls | Should Be 2
+  }
+
   It '订阅新鲜度必须取 lastSuccessAt：节点池冻结时不得因为"刷新尝试过"而报绿' {
     # 判据回归锚点：updatedAt 记的是"刷新尝试"，lastSuccessAt 记的是"真正重写 merged.yaml"。
     # 若有人把 doctor 改回读 updatedAt，第一个场景会变绿 → 本用例红（2026-10-08 的真实缺陷）。
