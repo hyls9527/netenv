@@ -78,8 +78,31 @@ function Invoke-NetEnvNodesRefresh {
         if (Test-Path -LiteralPath $tmpSub) { Remove-Item -LiteralPath $tmpSub -Force -ErrorAction SilentlyContinue }
       }
     }
+    # 【直连兜底】2026-10-18 实测：经系统代理（mihomo 规则把 raw.githubusercontent.com 交给
+    # github-adaptive 组的 DIRECT 成员）下载订阅时，连续三次都是 "基础连接已经关闭: 发送时发生错误"；
+    # 而同一进程里**绕过系统代理直连**同一 URL 立刻 200 并取回完整正文（655200 / 277776 字节）。
+    # 后果是两个主力源全部判失败、只剩 wjkc（4 节点）成功，节点池冻结 47 小时 ——
+    # 与 README 里"节点池冻结 106 小时"同一类"全绿着坏"：刷新看起来跑过，节点却一个没换。
+    # 因此经代理 3 次全败后再补一次直连（.NET DefaultWebProxy 置空）：订阅 URL 只落到订阅服务器
+    # 自己，不经任何第三方出口，安全性不降级；用完立即还原代理设置。
+    if (-not $text) {
+      $savedProxy = [System.Net.WebRequest]::DefaultWebProxy
+      try {
+        [System.Net.WebRequest]::DefaultWebProxy = $null
+        # 直连窗口不能太短：实测 freesub 直连要 40s+（277776 字节、链路很慢），
+        # 25s 会把"慢但能下"的源误判成失败；这里与经代理尝试同口径放宽到 40s。
+        Invoke-WebRequest -Uri $url -OutFile $tmpSub -UseBasicParsing -TimeoutSec 40
+        $text = [System.IO.File]::ReadAllText($tmpSub, [System.Text.Encoding]::UTF8)
+        Write-NetEnvLog 'INFO' "nodes refresh: $($src.id) 经代理失败，改直连成功"
+      } catch {
+        $lastErr = $_
+      } finally {
+        [System.Net.WebRequest]::DefaultWebProxy = $savedProxy
+        if (Test-Path -LiteralPath $tmpSub) { Remove-Item -LiteralPath $tmpSub -Force -ErrorAction SilentlyContinue }
+      }
+    }
     try {
-      if (-not $text) { throw "下载失败（3 次重试后仍失败）: $($lastErr.Exception.Message)" }
+      if (-not $text) { throw "下载失败（经代理 3 次 + 直连兜底后仍失败）: $($lastErr.Exception.Message)" }
       if ($text -match '(?m)^\s*proxies\s*:') {
         $sanitized = Remove-NetEnvDangerousFields $text
         $out = Join-Path $subDir "$($src.id).yaml"
@@ -93,6 +116,10 @@ function Invoke-NetEnvNodesRefresh {
       }
     } catch {
       $sourceStatus[$src.id] = "下载失败: $($_.Exception.Message)"
+      # 失败必须落日志：2026-10-18 实测两轮刷新里两个主力源全败（随后节点池冻结 47 小时），
+      # 而 logs 里一条相关 WARN 都没有 —— 旧实现只把失败写进 sub-state.sourceStatus，
+      # 事后定位只能靠猜。日志只记源 id 与异常文本，绝不打印订阅 URL。
+      Write-NetEnvLog 'WARN' "nodes refresh: $($src.id) 下载失败: $($_.Exception.Message)"
     }
   }
 

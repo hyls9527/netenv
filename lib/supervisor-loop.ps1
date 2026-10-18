@@ -266,10 +266,12 @@ while ($true) {
             # 先记账再动手：刷新自身抛错时同样要退避，否则每轮都重试
             $st.lastRefreshAt = (Get-Date -Format 's')
             try {
-              $null = Invoke-NetEnvNodesRefresh
+              $refreshState = Invoke-NetEnvNodesRefresh
               # 必须重载：刷新只改文件，运行中的 mihomo 不会自己读新配置
               if (Update-NetEnvMihomoConfig -ControllerPort $controllerPort -ConfigPath $mergedFile) {
-                Write-NetEnvLog 'INFO' 'nodes refresh 完成，已重载 mihomo 配置'
+                # 不能只报"已重载"：2026-10-16 14:43 实测 0 个源成功也照样记"已重载"，
+                # 事后看日志会误以为节点换过。成功源数/是否真的写了 merged.yaml 必须一起记。
+                Write-NetEnvLog 'INFO' ("nodes refresh 完成（成功源 {0} 个 / mergedWritten={1}），已重载 mihomo 配置" -f [int]$refreshState.sourceOkCount, [bool]$refreshState.mergedWritten)
               }
               Start-Sleep -Seconds 12
               $r2 = Test-NetEnvEgressAny -Urls $probeUrls

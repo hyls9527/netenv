@@ -411,6 +411,19 @@ Describe 'doctor JSON 输出' {
       $o2 = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
       @($o2.checks | Where-Object { $_.id -eq 'subfresh' })[0].ok | Should Be $true
 
+      # 场景 2b（2026-10-18 实测）：这次"写过"（mergedWritten=true）但有源下载失败 →
+      # 仍判绿（节点还新鲜），但失败源必须写进 detail。实测当时只有 1/3 源成功，
+      # 745/749 个节点还是 47 小时前的旧数据，旧实现的 detail 对此只字不提。
+      $partial = @{
+        updatedAt = $now; lastSuccessAt = $now; mergedWritten = $true; anySourceOk = $true
+        sourceStatus = @{ 'free-x' = 'OK, 3 节点'; 'free-y' = '下载失败: 基础连接已经关闭' }
+      } | ConvertTo-Json -Depth 4
+      [System.IO.File]::WriteAllText((Join-Path $dir 'data/sub-state.json'), $partial, (New-Object System.Text.UTF8Encoding($false)))
+      $o2b = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+      $sf2b = @($o2b.checks | Where-Object { $_.id -eq 'subfresh' })
+      $sf2b[0].ok | Should Be $true
+      $sf2b[0].detail | Should Match 'free-y'
+
       # 场景 3（旧状态文件 + 节点池其实很旧）：没有 lastSuccessAt 时必须按 merged.yaml 落盘时间判，
       # **不能退回 updatedAt** —— 否则"升级前的状态 + 刚尝试过刷新"会把缺陷原样放回来
       (Get-Item -LiteralPath (Join-Path $dir 'data\merged.yaml')).LastWriteTime = (Get-Date).AddHours(-30)
@@ -433,6 +446,37 @@ Describe 'doctor JSON 输出' {
       $script:NetEnvRoot = $saved
       Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
+  }
+}
+
+Describe 'doctor 网关可达性判据' {
+  It '网关返回 426（非 2xx）时不得报「不可达」：拿到 HTTP 响应就证明服务在听' {
+    # 实测锚点 2026-10-18：本机端口 3001 上的网关服务对普通 GET / 返回 426 Upgrade Required，
+    # Invoke-WebRequest 对 426 抛异常，旧实现于是把活着的网关报成「不可达」，
+    # 与同一份报告里「端口 3001 被占用」自相矛盾（后者已证明有进程在听）。
+    # 只有根本没拿到 HTTP 响应（拒绝连接/超时）才允许判不可达。
+    . "$root\lib\doctor.ps1"
+    function Get-PortOwner { param([int]$Port) [PSCustomObject]@{ Port = $Port; Pid = 7852; Process = 'sub-store'; Path = 'sub-store.exe' } }
+    function Get-ScheduledTask { [CmdletBinding()] param() }
+    function Get-CimInstance { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    function Get-NetTCPConnection { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+    function Test-NetEnvEgressAny { param([string[]]$Urls, [int]$TimeoutSec)
+      [PSCustomObject]@{ Ok = $true; Status = 204; Ms = 1; Url = 'stub'; Error = $null } }
+    function Test-NetEnvGptEgress { param([string]$ProbeUrl, [int]$ProxyPort, [int]$TimeoutSec)
+      [PSCustomObject]@{ Ok = $true; Status = 401; Ms = 1; Url = $ProbeUrl; Reason = $null } }
+    function Test-NetEnvEgress { param([string]$ProbeUrl, [int]$TimeoutSec, [int]$ProxyPort, [switch]$VerifyCert)
+      [PSCustomObject]@{ Ok = $true; Status = 200; Ms = 1; Url = $ProbeUrl; Error = $null } }
+    function Invoke-WebRequest {
+      param([Parameter(ValueFromRemainingArguments = $true)]$Rest)
+      $ex = New-Object System.Exception('stub: 426 Upgrade Required')
+      $ex | Add-Member -NotePropertyName Response -NotePropertyValue (New-Object psobject -Property @{ StatusCode = [System.Net.HttpStatusCode]::UpgradeRequired })
+      throw $ex
+    }
+    $o = (Invoke-NetEnvDoctor -Json -NoExit) | ConvertFrom-Json
+    $gw = @($o.checks | Where-Object { $_.id -eq 'gw.subStore' })
+    $gw.Count | Should Be 1
+    $gw[0].ok | Should Be $true
+    $gw[0].detail | Should Match '426'
   }
 }
 
@@ -596,6 +640,49 @@ Describe '订阅刷新（离线，不触网）' {
       ([datetime]$st.lastSuccessAt -gt (Get-Date).AddMinutes(-5)) | Should Be $true
       (Test-Path -LiteralPath (Join-Path $dir 'data\merged.yaml')) | Should Be $true
     } finally {
+      $script:NetEnvRoot = $saved
+      if (-not $hadCred -and (Test-Path function:\Get-NetEnvCredentialValue)) { Remove-Item function:\Get-NetEnvCredentialValue -Force -ErrorAction SilentlyContinue }
+      if (-not $hadIwr -and (Test-Path function:\Invoke-WebRequest)) { Remove-Item function:\Invoke-WebRequest -Force -ErrorAction SilentlyContinue }
+      Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '经代理连败时必须直连兜底重试（2026-10-18 节点池冻结 47h 的锚点）' {
+    # 实测锚点：经系统代理（mihomo github-adaptive=DIRECT）下载 raw.githubusercontent.com 订阅
+    # 连续 3 次 "基础连接已经关闭"；同一进程里绕过系统代理直连同一 URL 立刻 200 取回全文。
+    # 没有直连兜底时两个主力源全部判失败、只剩 4 节点的 wjkc，节点池被冻结 47 小时且 doctor 全绿。
+    # 若删掉 nodes.ps1 的直连兜底分支，本用例会红（源状态变下载失败、merged.yaml 不写）。
+    $saved = $script:NetEnvRoot
+    $hadCred = Test-Path function:\Get-NetEnvCredentialValue
+    $hadIwr = Test-Path function:\Invoke-WebRequest
+    $savedProxy = [System.Net.WebRequest]::DefaultWebProxy
+    $dir = Join-Path $env:TEMP ('netenv-refresh-direct-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path (Join-Path $dir 'config') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dir 'data') -Force | Out-Null
+    try {
+      Copy-Item -LiteralPath (Join-Path $root 'config\netenv.json') -Destination (Join-Path $dir 'config\netenv.json') -Force
+      '[{"id":"test-ok","name":"ok","trusted":true}]' | Set-Content -LiteralPath (Join-Path $dir 'config\sources.json') -Encoding utf8
+      foreach ($g in 'GeoSite.dat', 'geoip.metadb') {
+        [System.IO.File]::WriteAllBytes((Join-Path $dir ("data\" + $g)), (New-Object byte[] 1000001))
+      }
+      function Get-NetEnvCredentialValue { param([string]$TargetName) return 'https://sub.example.invalid/nodes.yaml' }
+      # 必须先让测试进程带上系统代理，否则兜底分支根本不会被触发（换机可复现性）
+      [System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy('http://127.0.0.1:9')
+      $script:directCalls = 0
+      function Invoke-WebRequest {
+        param([string]$Uri, [string]$OutFile, [switch]$UseBasicParsing, [int]$TimeoutSec)
+        if ($null -ne [System.Net.WebRequest]::DefaultWebProxy) { throw 'stub: 经代理下载失败（握手被干扰）' }
+        $script:directCalls++
+        [System.IO.File]::WriteAllText($OutFile, "proxies:`n  - name: node-a`n    type: trojan`n    server: 1.2.3.4`n    port: 443`n    password: pw`n", (New-Object System.Text.UTF8Encoding($false)))
+      }
+      $script:NetEnvRoot = $dir
+      $st = Invoke-NetEnvNodesRefresh
+      $st.anySourceOk | Should Be $true
+      $st.mergedWritten | Should Be $true
+      [string]$st.sourceStatus['test-ok'] | Should Match 'OK'
+      $script:directCalls | Should Be 1
+    } finally {
+      [System.Net.WebRequest]::DefaultWebProxy = $savedProxy
       $script:NetEnvRoot = $saved
       if (-not $hadCred -and (Test-Path function:\Get-NetEnvCredentialValue)) { Remove-Item function:\Get-NetEnvCredentialValue -Force -ErrorAction SilentlyContinue }
       if (-not $hadIwr -and (Test-Path function:\Invoke-WebRequest)) { Remove-Item function:\Invoke-WebRequest -Force -ErrorAction SilentlyContinue }

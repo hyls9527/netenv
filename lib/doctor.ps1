@@ -180,7 +180,21 @@ function Invoke-NetEnvDoctor {
       $r = Invoke-WebRequest -Uri "http://127.0.0.1:$($item.p)/" -UseBasicParsing -TimeoutSec 3
       Add-Check "gw.$($item.n)" "网关 $($item.n)" $true "HTTP $($r.StatusCode)"
     } catch {
-      Add-Check "gw.$($item.n)" "网关 $($item.n)" $false '不可达'
+      # 【为什么"非 2xx 的 HTTP 响应"也算可达】本项判据是"网关照不照 HTTP 请求"，不是"根路径是否 2xx"。
+      # 实测 2026-10-18：本机端口 3001 上的网关服务对普通 GET / 返回 426 Upgrade Required，
+      # Invoke-WebRequest 对 426 抛异常，旧实现于是把**活着的网关**报成「不可达」，与上一项
+      # 「端口 3001 被占用」自相矛盾 —— 又是一条让人把体检结果当噪音的假红。
+      # 只有"根本没拿到 HTTP 响应"（拒绝连接/超时）才判不可达。
+      $httpCode = 0
+      try {
+        $resp = $_.Exception.Response
+        if ($resp) { $httpCode = [int]$resp.StatusCode }
+      } catch { $httpCode = 0 }
+      if ($httpCode -gt 0) {
+        Add-Check "gw.$($item.n)" "网关 $($item.n)" $true "HTTP $httpCode（服务在听；根路径响应码非 2xx）"
+      } else {
+        Add-Check "gw.$($item.n)" "网关 $($item.n)" $false '不可达'
+      }
     }
   }
 
@@ -218,17 +232,22 @@ function Invoke-NetEnvDoctor {
           Add-Check 'subfresh' '订阅新鲜度' $false 'sub-state.json 无可用时间戳（lastSuccessAt/updatedAt 均不可解析）'
         } else {
           $age = ((Get-Date) - $stamp).TotalHours
-          # 最近一次刷新没产出新节点时把失败源写进 detail：此时节点可能还新鲜（刷新只在出品探针
-          # 已判失败时被触发，源常常跟着一起抖），所以不直接判红；但"池子随时可能断供"必须可见，
-          # 不能再让一个被顶掉的 updatedAt 把它盖住。
+          # 失败源清单：无论这次刷新有没有写文件都要露出来。2026-10-18 实测只有 1/3 源成功、
+          # merged.yaml 因内容未变而"写成功"（mergedWritten=true），旧实现只在 mergedWritten=false
+          # 时列失败源，于是 doctor 报「0.1 小时前 / 绿」，而 745/749 个节点仍是 47 小时前的旧数据 ——
+          # 判据只能证明"写过"，证明不了"换过"，至少要让失败源一眼可见。
+          $failedSrc = @()
+          if ($st.sourceStatus) {
+            $failedSrc = @($st.sourceStatus.PSObject.Properties | Where-Object {
+              $_.Value -notlike 'OK,*' -and $_.Value -ne '已停用' -and $_.Value -notlike '未配置*'
+            } | ForEach-Object { "$($_.Name)=$($_.Value)" })
+          }
           if ($st.mergedWritten -eq $false) {
-            $failedSrc = @()
-            if ($st.sourceStatus) {
-              $failedSrc = @($st.sourceStatus.PSObject.Properties | Where-Object {
-                $_.Value -notlike 'OK,*' -and $_.Value -ne '已停用' -and $_.Value -notlike '未配置*'
-              } | ForEach-Object { "$($_.Name)=$($_.Value)" })
-            }
+            # 没产出新节点时节点池可能还新鲜（刷新只在出品探针已判失败时被触发，源常常跟着一起抖），
+            # 所以不直接判红；但"池子随时可能断供"必须可见，不能被一个被顶掉的 updatedAt 盖住。
             $stampNote += "；最近一次刷新未产出新节点$(if ($failedSrc.Count) { '（失败源: ' + ($failedSrc -join '; ') + '）' } else { '' })"
+          } elseif ($failedSrc.Count) {
+            $stampNote += "；最近一次刷新有失败源（$($failedSrc -join '; ')）"
           }
           Add-Check 'subfresh' '订阅新鲜度' ($age -lt 26) "上次成功更新 $([math]::Round($age,1)) 小时前（告警阈值 26h）$stampNote"
         }

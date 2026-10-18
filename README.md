@@ -64,6 +64,8 @@ data/  logs/  backups/  export/     运行态与归档（.gitignore，不入库�
   症状是"订阅看起来过期、GitHub 却还能打开"——能打开只是 `github-adaptive` 组的 `DIRECT` 成员在兜底，**924 个节点实际全部不可达**，节点池冻结 106 小时、`doctor` 报 4 项红而 `status` 照样报绿。
   修正前请先确认：`curl.exe` 能取回正文而 `Invoke-WebRequest` 不能，就是本缺陷；不要先去怀疑订阅 URL 失效或节点全挂。
   另注：这类干扰是**间歇性**的（同一批 URL 连续两轮，一轮 2/6 失败、一轮全成），因此 `nodes refresh` 对每个源做 3 次重试；单源失败率约 33% → <5%。
+  ⚠️ **2026-10-18 追加"直连兜底"**：经系统代理（规则把 `raw.githubusercontent.com` 交给 `github-adaptive` 组的 `DIRECT` 成员）下载订阅连续 3 次报 `基础连接已经关闭: 发送时发生错误`，而同一进程内**绕过系统代理直连**同一 URL 立刻 200（655200 / 277776 字节）。只靠 3 次经代理重试时两个主力源全败、只剩 4 节点的 wjkc 成功，节点池冻结 47 小时；而且 `doctor` 的「订阅新鲜度」会因为 `merged.yaml` 被重写（内容未变）而报绿 —— 该判据只证明"写过"，不证明"换过"。
+  现在 `nodes refresh` 在每个源经代理 3 次全败后追加 **1 次直连兜底**（`.NET DefaultWebProxy` 置空、用完立即还原）：订阅 URL 只落到订阅服务器本身，不经任何第三方出口。回归锚点见 `tests\netenv.tests.ps1` 的「经代理连败时必须直连兜底重试」。
 - **`.ps1` 一律带 UTF-8 BOM**：脚本含中文，且计划任务以 `powershell.exe`（Windows PowerShell 5.1）`-File` 方式执行；无 BOM 时 5.1 会按 ANSI/GBK 解码导致中文乱码。**改动任何 `.ps1` 后请复查 BOM。**
   检查/修补用 `.\tests\ensure-bom.ps1 -Check`（只检查）或 `.\tests\ensure-bom.ps1`（补 BOM，幂等）；`tests\regression.ps1` 已把它作为**前置守卫**，
   缺 BOM 时直接中止并点名文件。2026-10-06 实测过一次自伤：编辑工具剥掉 4 个 `lib\*.ps1` 的 BOM，生产自愈循环连续 7 分钟报
