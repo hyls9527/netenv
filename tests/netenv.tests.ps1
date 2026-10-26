@@ -225,6 +225,334 @@ rules:
   }
 }
 
+Describe '多网卡 multiWan' {
+  It '配置段存在且接口完整；显式关闭时生成结果不含 multiWan 组' {
+    $cfg = Read-NetEnvConfig
+    $cfg.multiWan | Should Not BeNullOrEmpty
+    @($cfg.multiWan.interfaces).Count | Should BeGreaterThan 1
+    # 生产配置当前可能已启用；这里显式关掉，验证“关闭时零影响”而不是依赖默认值。
+    $cfg.multiWan.enabled = $false
+    $subDir = Join-Path $env:TEMP ('netenv-mw-off-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      @'
+proxies:
+  - name: n1
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+    password: pw
+'@ | Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Encoding utf8
+      $out = Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg
+      $out | Should Not Match 'wan-lb'
+      $out | Should Not Match 'interface-name'
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It 'load-balance：按接口复制节点、生成组并置顶 proxy-select，且 mihomo 能加载' {
+    $subDir = Join-Path $env:TEMP ('netenv-mw-lb-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      @'
+proxies:
+  - name: n1
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+    password: pw
+  - name: n2
+    type: trojan
+    server: 1.2.3.5
+    port: 443
+    password: pw
+  - cipher: aes-256-gcm
+    name: n3
+    server: 1.2.3.6
+    port: 443
+    password: pw
+    type: ss
+'@ | Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+        enabled = $true
+        interfaces = @(
+          [PSCustomObject]@{ name = 'WLAN'; label = 'wlan' },
+          [PSCustomObject]@{ name = '以太网'; label = 'eth' }
+        )
+        mode = 'load-balance'
+        strategy = 'sticky-sessions'
+        maxNodes = 4
+        nodes = @('n1', 'n2', 'n3')
+        include = @()
+        exclude = @()
+        url = 'https://www.google.com/generate_204'
+        interval = 300
+        lazy = $true
+        prefer = $true
+      })
+      $out = Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg
+      @(Get-ClashProxyEntries $out).Count | Should Be 9
+      $out | Should Match 'name: "n1 @wlan"'
+      $out | Should Match 'name: "n1 @eth"'
+      $out | Should Match 'name: "n2 @wlan"'
+      $out | Should Match 'name: "n2 @eth"'
+      # cipher-first 的 ss 条目也必须能改名（否则会生成重名 proxy，mihomo 拒绝加载）
+      $out | Should Match 'name: "n3 @wlan"'
+      $out | Should Match 'name: "n3 @eth"'
+      ([regex]::Matches($out, 'interface-name: "WLAN"')).Count | Should Be 3
+      ([regex]::Matches($out, 'interface-name: "以太网"')).Count | Should Be 3
+      $out | Should Match 'name: wan-lb'
+      $out | Should Match '(?ms)name: wan-lb\s*\r?\n\s*type: load-balance\s*\r?\n\s*strategy: sticky-sessions'
+      $out | Should Match '(?ms)name: egress-select\s*\r?\n\s*type: select\s*\r?\n\s*proxies:\s*\r?\n\s*- wan-lb'
+      # proxy-select 必须保持 auto-urltest 打头：github-adaptive 以它为保底，不能被多网卡组劫持
+      $out | Should Match '(?ms)name: proxy-select\s*\r?\n\s*type: select\s*\r?\n\s*proxies:\s*\r?\n\s*- auto-urltest'
+      $out | Should Match '(?m)^\s*- MATCH,egress-select'
+      $mihomo = Join-Path $root 'data\bin\mihomo-windows-amd64.exe'
+      if (Test-Path -LiteralPath $mihomo) {
+        $gen = Join-Path $subDir 'gen.yaml'
+        [System.IO.File]::WriteAllText($gen, $out, (New-Object System.Text.UTF8Encoding($false)))
+        $null = & $mihomo -t -d (Join-Path $root 'data') -f $gen 2>&1
+        $LASTEXITCODE | Should Be 0
+      }
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It 'failover：生成 fallback 组，且优先保留接口 1 的节点顺序' {
+    $subDir = Join-Path $env:TEMP ('netenv-mw-fo-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      @'
+proxies:
+  - name: n1
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+    password: pw
+'@ | Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+        enabled = $true
+        interfaces = @(
+          [PSCustomObject]@{ name = 'WLAN'; label = 'wlan' },
+          [PSCustomObject]@{ name = '以太网'; label = 'eth' }
+        )
+        mode = 'failover'
+        maxNodes = 4
+        nodes = @('n1')
+        include = @()
+        exclude = @()
+        url = 'https://www.google.com/generate_204'
+        interval = 300
+        lazy = $true
+        prefer = $true
+      })
+      $out = Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg
+      $out | Should Match 'name: wan-failover'
+      $out | Should Match '(?ms)name: wan-failover\s*\r?\n\s*type: fallback'
+      $out | Should Match '(?ms)name: egress-select\s*\r?\n\s*type: select\s*\r?\n\s*proxies:\s*\r?\n\s*- wan-failover'
+      $out | Should Match '(?m)^\s*- MATCH,egress-select'
+      $iWlan = $out.IndexOf('"n1 @wlan"')
+      $iEth = $out.IndexOf('"n1 @eth"')
+      ($iWlan -gt 0) | Should Be $true
+      ($iEth -gt $iWlan) | Should Be $true
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It 'prefer=false 只生成组，不改变线上 MATCH' {
+    $subDir = Join-Path $env:TEMP ('netenv-mw-nopref-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      @'
+proxies:
+  - name: n1
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+    password: pw
+'@ | Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+        enabled = $true
+        interfaces = @(
+          [PSCustomObject]@{ name = 'WLAN'; label = 'wlan' },
+          [PSCustomObject]@{ name = '以太网'; label = 'eth' }
+        )
+        mode = 'load-balance'
+        maxNodes = 4
+        nodes = @('n1')
+        include = @()
+        exclude = @()
+        url = 'https://www.google.com/generate_204'
+        interval = 300
+        lazy = $true
+        prefer = $false
+      })
+      $out = Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg
+      $out | Should Match 'name: wan-lb'
+      $out | Should Match 'name: egress-select'
+      $out | Should Not Match 'MATCH,egress-select'
+      $out | Should Match 'MATCH,proxy-select'
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '接口不足两个或 nodes 全部不存在时安全跳过，不生成半个组' {
+    $subDir = Join-Path $env:TEMP ('netenv-mw-bad-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      @'
+proxies:
+  - name: n1
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+    password: pw
+'@ | Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+        enabled = $true
+        interfaces = @([PSCustomObject]@{ name = 'WLAN'; label = 'wlan' })
+        mode = 'load-balance'
+        maxNodes = 4
+        nodes = @()
+        include = @()
+        exclude = @()
+        url = 'https://www.google.com/generate_204'
+        interval = 300
+        lazy = $true
+        prefer = $true
+      })
+      (Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg) | Should Not Match 'wan-lb'
+
+      $cfg.multiWan.interfaces = @(
+        [PSCustomObject]@{ name = 'WLAN'; label = 'wlan' },
+        [PSCustomObject]@{ name = '以太网'; label = 'eth' }
+      )
+      $cfg.multiWan.nodes = @('missing-node')
+      (Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg) | Should Not Match 'wan-lb'
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '自动选点遵守 include/exclude 与 maxNodes' {
+    $subDir = Join-Path $env:TEMP ('netenv-mw-auto-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $subDir -Force | Out-Null
+    try {
+      @'
+proxies:
+  - name: n1
+    type: trojan
+    server: 1.2.3.1
+    port: 443
+    password: pw
+  - name: n2
+    type: trojan
+    server: 1.2.3.2
+    port: 443
+    password: pw
+  - name: n3
+    type: trojan
+    server: 1.2.3.3
+    port: 443
+    password: pw
+  - name: bad-node
+    type: trojan
+    server: 1.2.3.4
+    port: 443
+    password: pw
+'@ | Set-Content -LiteralPath (Join-Path $subDir 'a.yaml') -Encoding utf8
+      $cfg = Read-NetEnvConfig
+      $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+        enabled = $true
+        interfaces = @(
+          [PSCustomObject]@{ name = 'WLAN'; label = 'wlan' },
+          [PSCustomObject]@{ name = '以太网'; label = 'eth' }
+        )
+        mode = 'load-balance'
+        strategy = 'round-robin'
+        maxNodes = 2
+        nodes = @()
+        include = @('n')
+        exclude = @('bad')
+        url = 'https://www.google.com/generate_204'
+        interval = 300
+        lazy = $true
+        prefer = $true
+      })
+      $out = Build-NetEnvMergedConfig -SubDir $subDir -Cfg $cfg
+      $out | Should Match 'name: "n1 @wlan"'
+      $out | Should Match 'name: "n2 @wlan"'
+      $out | Should Not Match 'name: "n3 @wlan"'
+    } finally {
+      Remove-Item -LiteralPath $subDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  It '控制器候选按最近延迟排序并截断到 maxNodes' {
+    $cfg = Read-NetEnvConfig
+    $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+      enabled = $true
+      interfaces = @(
+        [PSCustomObject]@{ name = 'WLAN'; label = 'wlan' },
+        [PSCustomObject]@{ name = '以太网'; label = 'eth' }
+      )
+      mode = 'load-balance'
+      maxNodes = 2
+      nodes = @()
+      rankGroup = 'auto-urltest'
+      include = @()
+      exclude = @()
+    })
+    $orig = (Get-Item function:script:Get-NetEnvJsonUtf8).ScriptBlock
+    try {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value {
+        param($Uri, $TimeoutSec)
+        return ('{"proxies":{"auto-urltest":{"all":["n1","n2","n3"]},"n1":{"history":[{"delay":120}]},"n2":{"history":[{"delay":40}]},"n3":{"history":[]}}}' | ConvertFrom-Json)
+      }
+      $names = @(Get-NetEnvMultiWanCandidates -Cfg $cfg)
+      ($names -join ',') | Should Be 'n2,n1'
+    } finally {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value $orig
+    }
+  }
+
+  It '重载后从 cache 恢复旧选择时，显式把 egress-select 切到 multiWan 首成员' {
+    $cfg = Read-NetEnvConfig
+    $cfg | Add-Member -Force -NotePropertyName multiWan -NotePropertyValue ([PSCustomObject]@{
+      enabled = $true
+      prefer = $true
+    })
+    $origGet = (Get-Item function:script:Get-NetEnvJsonUtf8).ScriptBlock
+    $origPut = (Get-Item function:script:Invoke-NetEnvJsonPut).ScriptBlock
+    $script:mwPut = $null
+    try {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value {
+        param($Uri, $TimeoutSec)
+        return ('{"now":"proxy-select","all":["wan-lb","proxy-select","DIRECT"]}' | ConvertFrom-Json)
+      }
+      Set-Item function:script:Invoke-NetEnvJsonPut -Value {
+        param($Uri, $Json, $TimeoutSec)
+        $script:mwPut = [PSCustomObject]@{ Uri = $Uri; Json = $Json }
+        return $true
+      }
+      (Set-NetEnvMultiWanSelection -Cfg $cfg -ControllerPort 19090) | Should Be $true
+      ($script:mwPut.Uri -match '/proxies/egress-select$') | Should Be $true
+      ($script:mwPut.Json -match '"name"\s*:\s*"wan-lb"') | Should Be $true
+    } finally {
+      Set-Item function:script:Get-NetEnvJsonUtf8 -Value $origGet
+      Set-Item function:script:Invoke-NetEnvJsonPut -Value $origPut
+    }
+  }
+}
+
 Describe '配置读取与编码' {
   It '无 BOM 的 UTF-8 文件也能读出中文（PS 5.1 Get-Content 会按 GBK 解码成乱码）' {
     $dir = Join-Path $env:TEMP ('netenv-enc-' + [guid]::NewGuid().ToString('N').Substring(0, 8))

@@ -19,7 +19,7 @@ NetEnv v1 — 统一网络代理层
   doctor [--json]                 只读体检（冲突时退出码 1）
   status [--json]                 整体状态
   apply -profile direct|proxy|github | --undo [--snapshot <file>]
-  nodes refresh                   免费订阅源刷新 + 危险字段剥离
+  nodes refresh|reload            免费订阅源刷新 + 危险字段剥离 / 重载运行中的 mihomo
   clients check|apply             AI 软件连通验证 / 代理注入
   adopt [--apply] [--undo] [--report <file>] [--password <pw>]
   migrate                         导出新机配置包
@@ -61,7 +61,25 @@ try {
     }
     'nodes' {
       . "$PSScriptRoot\lib\nodes.ps1"
-      if ($Rest[0] -eq 'refresh') { Invoke-NetEnvNodesRefresh } else { throw "nodes 子命令: refresh" }
+      if ($Rest[0] -eq 'refresh') {
+        Invoke-NetEnvNodesRefresh
+      } elseif ($Rest[0] -eq 'reload') {
+        # nodes refresh 只写 data/merged.yaml；运行中的 mihomo 不会自己读新文件。
+        # 单开 reload 子命令，避免用户改完 multiWan 后误以为已生效（与自愈链同一重载助手）。
+        $cfg = Read-NetEnvConfig
+        $paths = Get-NetEnvPaths
+        $merged = Join-Path $paths.Data 'merged.yaml'
+        if (Update-NetEnvMihomoConfig -ControllerPort ([int]$cfg.ports.mihomoController) -ConfigPath $merged) {
+          # mihomo select 组会从 cache.db 恢复上次选择：只把 wan-lb 放第一位并不等于重载后生效。
+          # 这里显式切一次；控制器未就绪时返回 false，不把“重载成功”误报成“multiWan 已生效”。
+          $sel = Set-NetEnvMultiWanSelection -Cfg $cfg -ControllerPort ([int]$cfg.ports.mihomoController)
+          if ($sel) { 'mihomo 配置已重载；multiWan 默认组已生效' } else { 'mihomo 配置已重载' }
+        } else {
+          throw 'mihomo 配置重载失败（控制器不可达或 data/merged.yaml 不存在）'
+        }
+      } else {
+        throw 'nodes 子命令: refresh | reload'
+      }
     }
     'clients' {
       . "$PSScriptRoot\lib\clients.ps1"

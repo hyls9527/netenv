@@ -5,6 +5,7 @@
 - **一个入口**：mihomo（Clash.Meta）承担全部代理职责；端口表固定，冲突即报错（见 [docs/PORTS.md](docs/PORTS.md)）
 - **订阅管线**：`nodes refresh` 聚合多源免费订阅、剥离危险字段，生成 `data/merged.yaml`
 - **档位管理**：`apply -profile direct|proxy|github` 切换系统代理 / Git / npm / 环境变量，带快照可回滚
+- **多网卡（可选）**：`config/netenv.json` 的 `multiWan` 可把少量节点按网卡复制，生成 `load-balance`（多连接吞吐）/ `failover`（故障切换）组；默认关闭，启用与回滚见 [docs/MULTI-WAN.md](docs/MULTI-WAN.md)
 - **LLM 网关**：本机 new-api 实例（端口表 8093）作为模型 API 统一入口
 - **AI 可达性**：`netenv-mcp.ps1` 提供只读、输出脱敏的 MCP 状态检测
 - **密钥治理**：订阅 URL 只进 Windows 凭据管理器；GitHub token 验证 / 清理；AES-256 7z 归档（见 [docs/SECRETS.md](docs/SECRETS.md)）

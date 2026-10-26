@@ -174,6 +174,13 @@ while ($true) {
 
   try { & "$PSScriptRoot\supervisor.ps1" } catch { Write-NetEnvLog 'ERROR' "supervisor-loop: 单轮异常 $_" }
 
+  # ---- multiWan 默认出口重放（每轮都查，独立于探针周期）----
+  # 必要性：mihomo 重启/重载后 select 组会从 cache.db 恢复旧选择；只在 nodes reload 里切一次，
+  # 自愈链重载或进程重启后仍可能退回 auto-urltest。prefer=false 时不做任何干预，尊重手动选择。
+  if ($cfg.multiWan -and $cfg.multiWan.enabled -and $cfg.multiWan.prefer) {
+    try { [void](Set-NetEnvMultiWanSelection -Cfg $cfg -ControllerPort $controllerPort) } catch { }
+  }
+
   # ---- GPT 已验证节点的重放（每轮都查，独立于 5 分钟的探针周期）----
   # 必要性：mihomo 重载配置（nodes refresh / apply）后，select 组会重置回首个成员；
   # 不重放的话 GPT 会静默走回"未验证、甚至 OpenAI 不支持地区"的节点，而探针要 5 分钟后才发现。

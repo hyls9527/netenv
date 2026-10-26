@@ -135,7 +135,9 @@ function Invoke-NetEnvNodesRefresh {
   $mergedEmpty = $false
   $mergedWritten = $false
   if ($anyOk) {
-    $merged = Build-NetEnvMergedConfig $subDir $cfg
+    $mwNodes = @()
+    if ($cfg.multiWan -and $cfg.multiWan.enabled) { $mwNodes = @(Get-NetEnvMultiWanCandidates -Cfg $cfg) }
+    $merged = Build-NetEnvMergedConfig $subDir $cfg $mwNodes
     if ($merged -and $merged.Trim().Length -gt 0) {
       Save-NetEnvTextFile -Path $mergedFile -Content $merged
       $mergedWritten = $true
@@ -269,8 +271,223 @@ function ConvertFrom-YamlEscapedName {
   return $Name
 }
 
+function ConvertTo-NetEnvYamlQuoted {
+  param([string]$Value)
+  if ($null -eq $Value) { return '""' }
+  return '"' + ($Value.Replace('\', '\\').Replace('"', '\"')) + '"'
+}
+
+function Get-NetEnvMultiWanCandidates {
+  # 从运行中的 mihomo 控制器取 auto-urltest 的历史延迟，选最近一轮可达且延迟最低的 N 个节点。
+  # 目的：multiWan 只复制少量节点，不能靠订阅顺序瞎选（免费源前几个常是广告/死节点）。
+  # 控制器不可用（mihomo 正在故障、端口没起）时返回空数组，由 Build 走确定性过滤兜底。
+  param($Cfg)
+  if (-not $Cfg -or -not $Cfg.multiWan -or -not $Cfg.multiWan.enabled) { return @() }
+  $explicit = @()
+  foreach ($n in @($Cfg.multiWan.nodes)) { if ($n) { $explicit += [string]$n } }
+  if ($explicit.Count -gt 0) { return $explicit }
+
+  $maxNodes = 8
+  if ($null -ne $Cfg.multiWan.maxNodes) { $maxNodes = [int]$Cfg.multiWan.maxNodes }
+  if ($maxNodes -lt 1) { $maxNodes = 1 }
+  if ($maxNodes -gt 64) { $maxNodes = 64 }
+  $rankGroup = 'auto-urltest'
+  if ($Cfg.multiWan.rankGroup) { $rankGroup = [string]$Cfg.multiWan.rankGroup }
+  $port = 0
+  if ($Cfg.ports -and $Cfg.ports.mihomoController) { $port = [int]$Cfg.ports.mihomoController }
+  if ($port -le 0) { return @() }
+  try {
+    $data = Get-NetEnvJsonUtf8 -Uri ("http://127.0.0.1:{0}/proxies" -f $port) -TimeoutSec 4
+    $groupProp = $data.proxies.PSObject.Properties[$rankGroup]
+    if (-not $groupProp) { return @() }
+    $members = @($groupProp.Value.all)
+    $ranked = New-Object System.Collections.Generic.List[object]
+    foreach ($name in $members) {
+      $p = $data.proxies.PSObject.Properties[[string]$name]
+      if (-not $p) { continue }
+      $history = @($p.Value.history)
+      if ($history.Count -eq 0) { continue }
+      $last = $history[$history.Count - 1]
+      $delay = 0
+      if ($last -and $last.delay) { $delay = [int]$last.delay }
+      if ($delay -gt 0) { $ranked.Add([PSCustomObject]@{ Name = [string]$name; Delay = $delay }) }
+    }
+    $out = @()
+    foreach ($r in ($ranked | Sort-Object Delay | Select-Object -First $maxNodes)) { $out += $r.Name }
+    return $out
+  } catch {
+    return @()
+  }
+}
+
+function Set-NetEnvMultiWanSelection {
+  # 把 egress-select 切到 multiWan 生成的首成员。为什么必须显式切：mihomo 的 select 组会从
+  # cache.db 恢复上次选择，config 里把 wan-lb 放第一位并不等于重载后就会选它（本机实测
+  # 重载后仍是 auto-urltest）。只读一次控制器，已经是目标就不 PUT。
+  param($Cfg, [int]$ControllerPort = 19090)
+  if (-not $Cfg -or -not $Cfg.multiWan -or -not $Cfg.multiWan.enabled) { return $false }
+  if ($null -ne $Cfg.multiWan.prefer -and -not [bool]$Cfg.multiWan.prefer) { return $false }
+  try {
+    $psel = Get-NetEnvJsonUtf8 -Uri "http://127.0.0.1:$ControllerPort/proxies/egress-select" -TimeoutSec 5
+    $all = @($psel.all)
+    if ($all.Count -eq 0) { return $false }
+    $target = [string]$all[0]
+    # 生成计划被跳过时 egress-select 不存在（404）或首成员异常，不能把“没生成”误判成“已切换”。
+    if (@('proxy-select', 'auto-urltest', 'github-node', 'gpt-node', 'DIRECT') -contains $target) { return $false }
+    if ([string]$psel.now -eq $target) { return $true }
+    [void](Invoke-NetEnvJsonPut -Uri "http://127.0.0.1:$ControllerPort/proxies/egress-select" -Json (@{ name = $target } | ConvertTo-Json) -TimeoutSec 10)
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Get-NetEnvMultiWanPlan {
+  # 纯函数：只根据合并后的节点名列表与配置生成计划，不碰网络/不写文件，便于 Pester 覆盖。
+  param([string[]]$Order, $Cfg, [string[]]$PreferredNodes = @())
+  if (-not $Cfg -or -not $Cfg.multiWan) { return $null }
+  $mw = $Cfg.multiWan
+  if (-not $mw.enabled) { return $null }
+
+  $ifaces = New-Object System.Collections.Generic.List[object]
+  $usedLabels = @{}
+  $ifIndex = 0
+  foreach ($item in @($mw.interfaces)) {
+    if ($null -eq $item) { continue }
+    $ifIndex = $ifIndex + 1
+    $name = ''
+    $label = ''
+    if ($item -is [string]) {
+      $name = [string]$item
+    } else {
+      if ($item.name) { $name = [string]$item.name }
+      if ($item.label) { $label = [string]$item.label }
+    }
+    $name = $name.Trim()
+    if (-not $name) { continue }
+    if (-not $label) {
+      if ($name -match '^[A-Za-z0-9_-]+$') { $label = $name.ToLower() } else { $label = 'wan' + [string]$ifIndex }
+    }
+    $label = ($label.ToLower() -replace '[^a-z0-9_-]', '')
+    if (-not $label) { $label = 'wan' + [string]$ifIndex }
+    if ($usedLabels.ContainsKey($label)) { $label = $label + [string]$ifIndex }
+    $usedLabels[$label] = $true
+    $ifaces.Add([PSCustomObject]@{ Name = $name; Label = $label })
+  }
+  if ($ifaces.Count -lt 2) {
+    Write-NetEnvLog 'WARN' 'multiWan: interfaces 少于两个，已跳过'
+    return $null
+  }
+
+  $mode = 'load-balance'
+  if ([string]$mw.mode -eq 'failover') { $mode = 'failover' }
+  $strategy = 'sticky-sessions'
+  if (@('round-robin', 'consistent-hashing', 'sticky-sessions') -contains [string]$mw.strategy) {
+    $strategy = [string]$mw.strategy
+  }
+
+  $maxNodes = 8
+  if ($null -ne $mw.maxNodes) { $maxNodes = [int]$mw.maxNodes }
+  if ($maxNodes -lt 1) { $maxNodes = 1 }
+  if ($maxNodes -gt 64) { $maxNodes = 64 }
+  $include = @()
+  foreach ($p in @($mw.include)) { if ($p) { $include += [string]$p } }
+  $exclude = @()
+  foreach ($p in @($mw.exclude)) { if ($p) { $exclude += [string]$p } }
+  $explicit = @()
+  foreach ($n in @($mw.nodes)) { if ($n) { $explicit += [string]$n } }
+
+  $selected = New-Object System.Collections.Generic.List[string]
+  if ($explicit.Count -gt 0) {
+    foreach ($n in $explicit) {
+      if (($Order -contains $n) -and (-not $selected.Contains($n))) { $selected.Add($n) }
+    }
+    if ($selected.Count -eq 0) {
+      Write-NetEnvLog 'WARN' 'multiWan: nodes 中列出的节点在本次合并结果中都不存在，已跳过'
+      return $null
+    }
+  } else {
+    foreach ($n in @($PreferredNodes)) {
+      if ($n -and ($Order -contains $n) -and (-not $selected.Contains([string]$n))) { $selected.Add([string]$n) }
+      if ($selected.Count -ge $maxNodes) { break }
+    }
+    if ($selected.Count -eq 0) {
+      foreach ($n in $Order) {
+        $keep = $true
+        if ($include.Count -gt 0) {
+          $keep = $false
+          foreach ($p in $include) { if ($n -like ('*' + $p + '*')) { $keep = $true; break } }
+        }
+        if ($keep -and $exclude.Count -gt 0) {
+          foreach ($p in $exclude) { if ($n -like ('*' + $p + '*')) { $keep = $false; break } }
+        }
+        if ($keep) { $selected.Add($n) }
+        if ($selected.Count -ge $maxNodes) { break }
+      }
+    }
+  }
+  if ($selected.Count -eq 0) {
+    Write-NetEnvLog 'WARN' 'multiWan: 没有可用节点，已跳过'
+    return $null
+  }
+
+  $reserved = @('proxy-select', 'auto-urltest', 'github-node', 'github-adaptive', 'gpt-node', 'gpt-adaptive', 'gpt-probe')
+  $topGroup = 'wan-lb'
+  if ($mode -eq 'failover') { $topGroup = 'wan-failover' }
+  if ($mw.groupName) {
+    $candidate = ([string]$mw.groupName).Trim()
+    $candidate = $candidate -replace '[^A-Za-z0-9_-]', '-'
+    if ($candidate) { $topGroup = $candidate }
+  }
+  if (($reserved -contains $topGroup) -or ($Order -contains $topGroup)) { $topGroup = 'mw-' + $topGroup }
+
+  $usedNames = @{}
+  foreach ($n in $Order) { $usedNames[$n] = $true }
+  $duplicates = New-Object System.Collections.Generic.List[object]
+  foreach ($n in $selected) {
+    foreach ($iface in $ifaces) {
+      $dupName = $n + ' @' + $iface.Label
+      $suffix = 2
+      while ($usedNames.ContainsKey($dupName)) {
+        $dupName = $n + ' @' + $iface.Label + '#' + [string]$suffix
+        $suffix = $suffix + 1
+      }
+      $usedNames[$dupName] = $true
+      $duplicates.Add([PSCustomObject]@{
+        Name = $dupName
+        Node = $n
+        Interface = $iface.Name
+        Label = $iface.Label
+      })
+    }
+  }
+
+  $probeUrl = 'https://www.google.com/generate_204'
+  if ($mw.url) { $probeUrl = [string]$mw.url }
+  elseif ($Cfg.subscription -and $Cfg.subscription.urlTest -and $Cfg.subscription.urlTest.url) { $probeUrl = [string]$Cfg.subscription.urlTest.url }
+  $interval = 300
+  if ($null -ne $mw.interval) { $interval = [int]$mw.interval }
+  if ($interval -lt 30) { $interval = 30 }
+  $lazy = $true
+  if ($null -ne $mw.lazy) { $lazy = [bool]$mw.lazy }
+  $prefer = $true
+  if ($null -ne $mw.prefer) { $prefer = [bool]$mw.prefer }
+
+  return [PSCustomObject]@{
+    Mode = $mode
+    Strategy = $strategy
+    TopGroup = $topGroup
+    Prefer = $prefer
+    Url = $probeUrl
+    Interval = $interval
+    Lazy = $lazy
+    Interfaces = $ifaces.ToArray()
+    Duplicates = $duplicates.ToArray()
+  }
+}
+
 function Build-NetEnvMergedConfig {
-  param([string]$SubDir, $Cfg)
+  param([string]$SubDir, $Cfg, [string[]]$MultiWanNodeNames = @())
   $files = @(Get-ChildItem -LiteralPath $SubDir -Filter '*.yaml' -ErrorAction SilentlyContinue | Sort-Object Name)
   if ($files.Count -eq 0) { return '' }
 
@@ -303,8 +520,36 @@ function Build-NetEnvMergedConfig {
   }
   if ($order.Count -eq 0) { return '' }
 
+  $mwPlan = $null
+  if ($Cfg -and $Cfg.multiWan -and $Cfg.multiWan.enabled) {
+    $mwPlan = Get-NetEnvMultiWanPlan -Order @($order) -Cfg $Cfg -PreferredNodes $MultiWanNodeNames
+  }
+
   $proxiesLines = (New-Object System.Collections.Generic.List[string])
   foreach ($n in $order) { $proxiesLines.Add((ConvertTo-NetEnvNormalizedEntry $byName[$n])) }
+  if ($mwPlan) {
+    # flow 写法（- {name: ...}）无法安全地在后面追加字段；一旦有这种节点，整块 multiWan 放弃，
+    # 避免生成“组里引用了不存在的成员”的配置让 mihomo 直接拒绝加载。
+    $flowNodes = @()
+    foreach ($d in $mwPlan.Duplicates) {
+      if ($byName[$d.Node] -match '(?m)^\s+-\s+\{') { $flowNodes += $d.Node }
+    }
+    if ($flowNodes.Count -gt 0) {
+      Write-NetEnvLog 'WARN' ("multiWan: 节点为行内 flow 写法，无法附加 interface-name，已跳过: " + (($flowNodes | Select-Object -Unique) -join ', '))
+      $mwPlan = $null
+    }
+  }
+  if ($mwPlan) {
+    foreach ($d in $mwPlan.Duplicates) {
+      $baseEntry = ConvertTo-NetEnvNormalizedEntry $byName[$d.Node]
+      $baseEntry = [regex]::Replace($baseEntry, '(?m)^(\s*(?:-\s+)?name\s*:\s*).*$', {
+        param($m)
+        return $m.Groups[1].Value + (ConvertTo-NetEnvYamlQuoted $d.Name)
+      }, 1)
+      $proxiesLines.Add($baseEntry + "`n    interface-name: " + (ConvertTo-NetEnvYamlQuoted $d.Interface))
+    }
+    Write-NetEnvLog 'INFO' ("multiWan: 组 {0}，模式 {1}，节点 {2} 个 × 接口 {3} 个，共 {4} 条出站" -f $mwPlan.TopGroup, $mwPlan.Mode, @($mwPlan.Duplicates | ForEach-Object { $_.Node } | Select-Object -Unique).Count, @($mwPlan.Interfaces).Count, @($mwPlan.Duplicates).Count)
+  }
   $proxiesBlock = ($proxiesLines -join "`n")
 
   $directDomains = @()
@@ -337,6 +582,60 @@ function Build-NetEnvMergedConfig {
   $groupNames = foreach ($n in $order) {
     $esc = $n.Replace('\', '\\').Replace('"', '\"')
     "      - `"$esc`""
+  }
+
+  # multiWan：把少量节点按接口各复制一份，放进一个 load-balance（吞吐）或 fallback（故障切换）组。
+  # 组名与成员全部在这里生成；关闭时两个变量为空，输出与旧版逐字节一致（回归用例钉住）。
+  $multiWanGroupsBlock = ''
+  $proxySelectLines = New-Object System.Collections.Generic.List[string]
+  if ($mwPlan) {
+    $members = New-Object System.Collections.Generic.List[string]
+    if ($mwPlan.Mode -eq 'failover') {
+      # fallback 按顺序取第一个可用成员：先放接口 1 的全部节点，再放接口 2，才叫“链路故障切换”。
+      foreach ($iface in $mwPlan.Interfaces) {
+        foreach ($d in $mwPlan.Duplicates) {
+          if ($d.Label -eq $iface.Label) { $members.Add((ConvertTo-NetEnvYamlQuoted $d.Name)) }
+        }
+      }
+    } else {
+      foreach ($d in $mwPlan.Duplicates) { $members.Add((ConvertTo-NetEnvYamlQuoted $d.Name)) }
+    }
+    $mwType = 'load-balance'
+    if ($mwPlan.Mode -eq 'failover') { $mwType = 'fallback' }
+    $mwLines = New-Object System.Collections.Generic.List[string]
+    $mwLines.Add('  - name: ' + $mwPlan.TopGroup)
+    $mwLines.Add('    type: ' + $mwType)
+    if ($mwType -eq 'load-balance') { $mwLines.Add('    strategy: ' + $mwPlan.Strategy) }
+    $mwLines.Add('    url: ' + (ConvertTo-NetEnvYamlQuoted $mwPlan.Url))
+    $mwLines.Add('    interval: ' + [string]$mwPlan.Interval)
+    $mwLines.Add('    tolerance: 50')
+    $mwLines.Add('    lazy: ' + $mwPlan.Lazy.ToString().ToLower())
+    $mwLines.Add('    proxies:')
+    foreach ($m in $members) { $mwLines.Add('      - ' + $m) }
+    $multiWanGroupsBlock = ($mwLines -join [Environment]::NewLine) + [Environment]::NewLine
+  }
+  $proxySelectLines.Add('      - auto-urltest')
+  $proxySelectLines.Add('      - github-node')
+  $proxySelectLines.Add('      - gpt-node')
+  $proxySelectLines.Add('      - DIRECT')
+  $proxySelectBlock = $proxySelectLines -join [Environment]::NewLine
+
+  # 为什么另开 egress-select，而不是把 wan-lb 塞进 proxy-select：
+  # github-adaptive 的成员里有 proxy-select；一旦 proxy-select 被切成 wan-lb，GitHub 的保底
+  # 也会跟着走多网卡组（实测 2026-10-19 启用后 github.com 从 200 变成 000）。
+  # 因此 proxy-select 保持原样，只让 MATCH 走 egress-select；prefer=false 时连 MATCH 都不改。
+  $multiWanEgressBlock = ''
+  $proxyMatchTarget = 'proxy-select'
+  if ($mwPlan) {
+    $egressLines = New-Object System.Collections.Generic.List[string]
+    $egressLines.Add('  - name: egress-select')
+    $egressLines.Add('    type: select')
+    $egressLines.Add('    proxies:')
+    $egressLines.Add('      - ' + $mwPlan.TopGroup)
+    $egressLines.Add('      - proxy-select')
+    $egressLines.Add('      - DIRECT')
+    $multiWanEgressBlock = ($egressLines -join [Environment]::NewLine) + [Environment]::NewLine
+    if ($mwPlan.Prefer) { $proxyMatchTarget = 'egress-select' }
   }
 
   # 探针专用入口 + 专用节点池。端口缺省时**整块不生成**（含 IN-PORT 规则）：
@@ -418,13 +717,10 @@ dns:
 proxies:
 $proxiesBlock
 proxy-groups:
-  - name: proxy-select
+$multiWanGroupsBlock  - name: proxy-select
     type: select
     proxies:
-      - auto-urltest
-      - github-node
-      - gpt-node
-      - DIRECT
+$proxySelectBlock
   - name: auto-urltest
     type: url-test
     url: $($Cfg.subscription.urlTest.url)
@@ -473,6 +769,7 @@ $probeGroupsBlock
       - gpt-node
       - proxy-select
       - DIRECT
+$multiWanEgressBlock
 rules:
 $probeRuleText
 $ruleText
@@ -480,7 +777,7 @@ $adaptiveRuleText
 $gptRuleText
     - GEOSITE,cn,DIRECT
     - GEOIP,CN,DIRECT,no-resolve
-    - MATCH,proxy-select
+    - MATCH,$proxyMatchTarget
 "@
   return $merged
 }

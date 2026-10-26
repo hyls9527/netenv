@@ -10,6 +10,7 @@
 | [GITHUB-SAFETY.md](GITHUB-SAFETY.md) | GitHub 认证流量与凭据安全细则（最高优先级） |
 | [SECRETS.md](SECRETS.md) | 密钥盘点 / 验证 / 归档 / 清理 |
 | [MCP.md](MCP.md) | MCP 接入与权限 |
+| [MULTI-WAN.md](MULTI-WAN.md) | Wi-Fi + 以太网叠加：开源方案对比、选型与 Phase 1 实现（2026-10-19） |
 | [AI-CLIENTS.md](AI-CLIENTS.md) | AI 软件（编辑器 / CLI）代理接入 |
 | [SETUP-NEW-PC.md](SETUP-NEW-PC.md) | 新机装配 |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | 排障 |

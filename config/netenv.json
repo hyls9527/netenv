@@ -8,6 +8,49 @@
                   "newApi":  8093,
                   "subStore":  3001
               },
+    "multiWan":  {
+                     "enabled":  false,
+                     "interfaces":  [
+                                        {
+                                            "name":  "以太网 4",
+                                            "label":  "usb4"
+                                        },
+                                        {
+                                            "name":  "以太网 5",
+                                            "label":  "usb5"
+                                        }
+                                    ],
+                     "mode":  "load-balance",
+                     "strategy":  "sticky-sessions",
+                     "maxNodes":  8,
+                     "nodes":  [
+                               ],
+                     "include":  [
+                                     "hysteria2-",
+                                     "vless-",
+                                     "trojan-",
+                                     "ss-",
+                                     "vmess-",
+                                     "tuic-"
+                                 ],
+                     "exclude":  [
+                                     "github.com/",
+                                     "免费",
+                                     "剩余",
+                                     "到期",
+                                     "官网",
+                                     "套餐",
+                                     "电报",
+                                     "日期",
+                                     "请充值",
+                                     "节点列表",
+                                     "自动选择"
+                                 ],
+                     "url":  "https://www.cloudflare.com/cdn-cgi/trace",
+                     "interval":  300,
+                     "lazy":  true,
+                     "prefer":  true
+                 },
     "logging":  {
                     "rotateDays":  14,
                     "dir":  "logs"
